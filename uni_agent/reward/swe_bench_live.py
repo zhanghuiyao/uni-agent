@@ -66,9 +66,9 @@ class SWEBenchLiveVerifySpec(BaseModel):
             "#!/bin/bash",
             "set -uxo pipefail",
             apply_test_patch_command,
-            f": '{START_TEST_OUTPUT}'",
+            f"echo '{START_TEST_OUTPUT}'",
             *test_cmds,
-            f": '{END_TEST_OUTPUT}'",
+            f"echo '{END_TEST_OUTPUT}'",
         ]
         eval_script = "\n".join(eval_script_list)
         return eval_script

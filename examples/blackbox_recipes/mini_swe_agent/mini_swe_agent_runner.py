@@ -27,6 +27,7 @@ from examples.blackbox_recipes.sandbox_client import (
 from uni_agent.gateway.session import SessionHandle
 
 logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
 
 DEFAULT_TOOL_IMAGE = "swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest"
 

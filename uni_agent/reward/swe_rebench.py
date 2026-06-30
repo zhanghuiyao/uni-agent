@@ -61,9 +61,9 @@ def _make_eval_script_list(instance, specs, env_name, repo_directory, base_commi
     eval_commands += [
         reset_tests_command,
         apply_test_patch_command,
-        f": '{START_TEST_OUTPUT}'",
+        f"echo '{START_TEST_OUTPUT}'",
         test_command,
-        f": '{END_TEST_OUTPUT}'",
+        f"echo '{END_TEST_OUTPUT}'",
         reset_tests_command,  # Revert tests after done, leave the repo in the same state as before
     ]
     return eval_commands

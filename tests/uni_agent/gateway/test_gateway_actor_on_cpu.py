@@ -898,6 +898,55 @@ async def test_gateway_actor_continuation_preserves_prompt_and_generation_masks(
     assert trajectories[0].response_mask[-len("SECOND") :] == [1] * len("SECOND")
 
 
+@pytest.mark.asyncio
+async def test_gateway_actor_debug_dump_includes_message_history(tmp_path, monkeypatch):
+    """Debug trajectory dumps include gateway-visible conversation messages.
+
+    Trajectory is token-only, so the debug dump must snapshot the session's
+    ``message_history`` separately to make gateway conversation state
+    inspectable offline.
+    """
+    from uni_agent.gateway.config import GatewayActorConfig
+    from uni_agent.gateway.gateway import _GatewayActor
+
+    monkeypatch.setenv("DEBUG_MODE", "1")
+    monkeypatch.setenv("UNI_AGENT_GATEWAY_TRAJECTORY_DIR", str(tmp_path))
+    monkeypatch.setenv("UNI_AGENT_GATEWAY_DEBUG_MESSAGE_MAX_CHARS", "16")
+
+    actor = _GatewayActor(GatewayActorConfig(tokenizer=FakeTokenizer()), QueuedBackend(["FIRST", "SECOND"]))
+    await actor.start()
+    try:
+        await actor.create_session("session-debug-dump")
+        await actor._handle_chat_completions(
+            "session-debug-dump",
+            {"model": "dummy-model", "messages": [{"role": "user", "content": "first turn"}]},
+        )
+        await actor._handle_chat_completions(
+            "session-debug-dump",
+            {
+                "model": "dummy-model",
+                "messages": [
+                    {"role": "user", "content": "first turn"},
+                    {"role": "assistant", "content": "FIRST"},
+                    {"role": "user", "content": "follow up " + ("x" * 32)},
+                ],
+            },
+        )
+
+        await actor.finalize_session("session-debug-dump")
+    finally:
+        await actor.shutdown()
+
+    dump = json.loads((tmp_path / "session-debug-dump.json").read_text(encoding="utf-8"))
+
+    assert dump["gateway_debug"]["message_count"] == 4
+    assert dump["gateway_debug"]["roles"] == ["user", "assistant", "user", "assistant"]
+    assert dump["gateway_debug"]["message_history"][0] == {"role": "user", "content": "first turn"}
+    assert dump["gateway_debug"]["message_history"][2]["content"].startswith("follow up ")
+    assert "truncated" in dump["gateway_debug"]["message_history"][2]["content"]
+    assert dump["gateway_debug"]["message_history"][3] == {"role": "assistant", "content": "SECOND"}
+
+
 @pytest.mark.parametrize(
     ("arguments_a", "arguments_b", "expect_equal"),
     [

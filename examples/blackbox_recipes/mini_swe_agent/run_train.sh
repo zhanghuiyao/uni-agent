@@ -98,7 +98,7 @@ fi
 SWE_AGENT_RUN_TIMEOUT="${SWE_AGENT_RUN_TIMEOUT:-7200}"
 CONDA_ENV="${CONDA_ENV:-testbed}"
 GATEWAY_COUNT="${GATEWAY_COUNT:-1}"
-MAX_CONCURRENT_SESSIONS="${MAX_CONCURRENT_SESSIONS:-32}"
+MAX_CONCURRENT_SESSIONS="${MAX_CONCURRENT_SESSIONS:-128}"
 NUM_AGENT_WORKERS="${NUM_AGENT_WORKERS:-8}"
 RUNNER_ARGS=(
     "actor_rollout_ref.rollout.agent.agent_loop_manager_class=uni_agent.framework.entry.AgentFrameworkRolloutAdapter"
@@ -139,6 +139,9 @@ export GATEWAY_COUNT
 export AKERNEL_SERVER_ADDRESS
 export AKERNEL_TOKEN
 export AKERNEL_TUNNEL_SSL_VERIFY
+export VERL_LOGGING_LEVEL="${VERL_LOGGING_LEVEL:-INFO}"
+export RAY_DEDUP_LOGS="${RAY_DEDUP_LOGS:-0}"
+export PYTHONUNBUFFERED="${PYTHONUNBUFFERED:-1}"
 export PYTHONPATH="${REPO_ROOT}:${REPO_ROOT}/verl:${PYTHONPATH:-}"
 
 echo "=== SWE-Agent Blackbox Megatron Async Training ==="
@@ -185,6 +188,9 @@ env_vars = {
         "SWE_AGENT_RUN_TIMEOUT",
         "CONDA_ENV",
         "GATEWAY_COUNT",
+        "VERL_LOGGING_LEVEL",
+        "RAY_DEDUP_LOGS",
+        "PYTHONUNBUFFERED",
     )
     if (value := os.environ.get(key)) is not None
 }
@@ -205,7 +211,8 @@ else
 fi
 if ! timeout "${RAY_STATUS_TIMEOUT}" ray status &>/dev/null; then
     echo "Starting Ray cluster (${TOTAL_GPUS} GPUs)..."
-    ray start --head --num-gpus="${TOTAL_GPUS}" --disable-usage-stats
+    # ray start --head --num-gpus="${TOTAL_GPUS}" --disable-usage-stats
+    ray start --head --resources='{"NPU": 8}' --disable-usage-stats
 else
     echo "Ray cluster already running."
 fi
@@ -248,6 +255,11 @@ MAIN_CMD=(
     actor_rollout_ref.rollout.n_gpus_per_node=${ROLLOUT_NGPUS_PER_NODE} \
     actor_rollout_ref.rollout.tensor_model_parallel_size=${GEN_TP} \
     actor_rollout_ref.rollout.gpu_memory_utilization=${ROLLOUT_GPU_MEM_UTIL} \
+    '+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config.cudagraph_mode="FULL_DECODE_ONLY"' \
+    '+actor_rollout_ref.rollout.engine_kwargs.vllm.mamba_cache_mode=align' \
+    '+actor_rollout_ref.rollout.engine_kwargs.vllm.additional_config.enable_cpu_binding=true' \
+    '+actor_rollout_ref.rollout.engine_kwargs.vllm.async_scheduling=true' \
+    actor_rollout_ref.rollout.multi_turn.max_assistant_turns=${MAX_TURNS} \
     actor_rollout_ref.rollout.agent.num_workers=${NUM_AGENT_WORKERS} \
     "${RUNNER_ARGS[@]}" \
     actor_rollout_ref.actor.clip_ratio_low=${CLIP_RATIO_LOW} \

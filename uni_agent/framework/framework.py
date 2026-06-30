@@ -3,6 +3,8 @@ from __future__ import annotations
 import asyncio
 import logging
 import random
+import time
+import os
 from dataclasses import dataclass, replace
 from functools import partial
 from typing import Protocol
@@ -25,6 +27,25 @@ from .base import AgentFramework
 from .multi_modal_postprocess import compute_multi_modal_inputs, compute_position_ids
 
 logger = logging.getLogger(__name__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "INFO"))
+
+
+def _ray_resource_snapshot() -> str:
+    """Return a compact Ray resource snapshot for concurrency diagnostics."""
+    try:
+        available = ray.available_resources()
+        total = ray.cluster_resources()
+    except Exception as exc:
+        return f"ray_resources=unavailable({exc.__class__.__name__}: {exc})"
+
+    resource_names = ("CPU", "GPU", "NPU")
+    parts = []
+    for name in resource_names:
+        if name in available or name in total:
+            parts.append(f"{name}={available.get(name, 0)}/{total.get(name, 0)}")
+    if not parts:
+        return "ray_resources=empty"
+    return "ray_resources(" + ", ".join(parts) + ")"
 
 
 class AgentRunner(Protocol):
@@ -94,23 +115,54 @@ def _materialize_runner(runner_fqn: str, runner_kwargs: dict[str, object]):
 @ray.remote
 def _run_agent_runner_ray_task(
     *,
+    runner_name: str,
     runner_fqn: str,
     runner_kwargs: dict[str, object],
     raw_prompt,
     session: SessionHandle,
     sample_index: int,
+    session_index: int,
     tools_kwargs: object | None,
 ) -> None:
     """Run only the user runner in Ray; parent owns session lifecycle outputs."""
-    runner = _materialize_runner(runner_fqn, runner_kwargs)
-    asyncio.run(
-        runner(
-            raw_prompt=raw_prompt,
-            session=session,
-            sample_index=sample_index,
-            **({"tools_kwargs": tools_kwargs} if tools_kwargs is not None else {}),
-        )
+    started_at = time.monotonic()
+    try:
+        runtime_context = ray.get_runtime_context()
+        node_id = runtime_context.get_node_id()
+        task_id = runtime_context.get_task_id()
+    except Exception:
+        node_id = "unknown"
+        task_id = "unknown"
+
+    logger.info(
+        "agent_runner_ray_task start runner=%s sample_index=%s session_index=%s node_id=%s task_id=%s %s",
+        runner_name,
+        sample_index,
+        session_index,
+        node_id,
+        task_id,
+        _ray_resource_snapshot(),
     )
+    runner = _materialize_runner(runner_fqn, runner_kwargs)
+    try:
+        asyncio.run(
+            runner(
+                raw_prompt=raw_prompt,
+                session=session,
+                sample_index=sample_index,
+                **({"tools_kwargs": tools_kwargs} if tools_kwargs is not None else {}),
+            )
+        )
+    finally:
+        logger.info(
+            "agent_runner_ray_task end runner=%s sample_index=%s session_index=%s elapsed=%.2fs node_id=%s task_id=%s",
+            runner_name,
+            sample_index,
+            session_index,
+            time.monotonic() - started_at,
+            node_id,
+            task_id,
+        )
 
 
 def _short_failure_reason(error: BaseException) -> str:
@@ -221,6 +273,10 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         self._rollout_config = rollout_config
         self._runner_semaphores: dict[str, asyncio.Semaphore] = {}
         self._semaphore_loop: asyncio.AbstractEventLoop | None = None
+        self._runner_active_sessions: dict[str, int] = {}
+        self._runner_pending_sessions: dict[str, int] = {}
+        self._runner_peak_sessions: dict[str, int] = {}
+        self._last_concurrency_log_at: dict[str, float] = {}
 
     @classmethod
     def from_config(
@@ -305,6 +361,21 @@ class OpenAICompatibleAgentFramework(AgentFramework):
         if num_sessions <= 0:
             raise ValueError(f"num_sessions must be positive, got {num_sessions}")
 
+        runner_caps = {
+            runner_name: runner_config.max_concurrent_sessions
+            for runner_name, runner_config in self.runner_registry.items()
+        }
+        logger.info(
+            "agent_framework batch start partition=%s num_prompts=%s sessions_per_prompt=%s "
+            "planned_sessions=%s runner_caps=%s %s",
+            partition_id,
+            len(prompts),
+            num_sessions,
+            len(prompts) * num_sessions,
+            runner_caps,
+            _ray_resource_snapshot(),
+        )
+
         # Batch layer: each sample/prompt owns its own group of rollout.n sessions.
         # Prompt tasks are isolated so one prompt failure does not drop the whole batch.
         tasks = []
@@ -344,7 +415,55 @@ class OpenAICompatibleAgentFramework(AgentFramework):
             stats["num_success_outputs"] += outcome["num_success_outputs"]
             stats["num_failed_uids"] += outcome["num_failed_uids"]
             failure_reasons.extend(outcome["failure_reasons"])
+        logger.info(
+            "agent_framework batch end partition=%s num_prompts=%s sessions_per_prompt=%s "
+            "success_sessions=%s failed_sessions=%s success_outputs=%s failed_uids=%s "
+            "runner_active=%s runner_peak=%s %s",
+            partition_id,
+            len(prompts),
+            num_sessions,
+            stats["num_success_sessions"],
+            stats["num_failed_sessions"],
+            stats["num_success_outputs"],
+            stats["num_failed_uids"],
+            dict(self._runner_active_sessions),
+            dict(self._runner_peak_sessions),
+            _ray_resource_snapshot(),
+        )
         return stats
+
+    def _log_runner_concurrency(
+        self,
+        *,
+        runner_name: str,
+        runner_cap: int,
+        event: str,
+        sample_index: int,
+        session_index: int,
+        force: bool = False,
+    ) -> None:
+        active = self._runner_active_sessions.get(runner_name, 0)
+        pending = self._runner_pending_sessions.get(runner_name, 0)
+        peak = self._runner_peak_sessions.get(runner_name, 0)
+        now = time.monotonic()
+        last = self._last_concurrency_log_at.get(runner_name, 0)
+        should_log = force or active == peak or pending >= runner_cap or now - last >= 30
+        if not should_log:
+            return
+        self._last_concurrency_log_at[runner_name] = now
+        logger.info(
+            "agent_framework concurrency event=%s runner=%s cap=%s active=%s pending=%s peak=%s "
+            "sample_index=%s session_index=%s %s",
+            event,
+            runner_name,
+            runner_cap,
+            active,
+            pending,
+            peak,
+            sample_index,
+            session_index,
+            _ray_resource_snapshot(),
+        )
 
     async def _run_prompt_sessions_to_tq(
         self,
@@ -449,27 +568,111 @@ class OpenAICompatibleAgentFramework(AgentFramework):
 
         runner_cap = runner_config.max_concurrent_sessions
         if runner_cap <= 0:
-            return await self._run_session(
-                sample_fields=sample_fields,
+            self._runner_pending_sessions[runner_name] = self._runner_pending_sessions.get(runner_name, 0) + 1
+            self._log_runner_concurrency(
+                runner_name=runner_name,
+                runner_cap=runner_cap,
+                event="unlimited_enter_pending",
                 sample_index=sample_index,
                 session_index=session_index,
-                runner_name=runner_name,
-                runner_config=runner_config,
+                force=True,
             )
+            self._runner_pending_sessions[runner_name] -= 1
+            self._runner_active_sessions[runner_name] = self._runner_active_sessions.get(runner_name, 0) + 1
+            self._runner_peak_sessions[runner_name] = max(
+                self._runner_peak_sessions.get(runner_name, 0),
+                self._runner_active_sessions[runner_name],
+            )
+            self._log_runner_concurrency(
+                runner_name=runner_name,
+                runner_cap=runner_cap,
+                event="unlimited_enter_active",
+                sample_index=sample_index,
+                session_index=session_index,
+            )
+            try:
+                return await self._run_session(
+                    sample_fields=sample_fields,
+                    sample_index=sample_index,
+                    session_index=session_index,
+                    runner_name=runner_name,
+                    runner_config=runner_config,
+                )
+            finally:
+                self._runner_active_sessions[runner_name] -= 1
+                self._log_runner_concurrency(
+                    runner_name=runner_name,
+                    runner_cap=runner_cap,
+                    event="unlimited_exit_active",
+                    sample_index=sample_index,
+                    session_index=session_index,
+                )
 
         runner_semaphore = self._runner_semaphores.get(runner_name)
         if runner_semaphore is None:
             runner_semaphore = asyncio.Semaphore(runner_cap)
             self._runner_semaphores[runner_name] = runner_semaphore
-
-        async with runner_semaphore:
-            return await self._run_session(
-                sample_fields=sample_fields,
-                sample_index=sample_index,
-                session_index=session_index,
-                runner_name=runner_name,
-                runner_config=runner_config,
+            logger.info(
+                "agent_framework semaphore initialized runner=%s cap=%s %s",
+                runner_name,
+                runner_cap,
+                _ray_resource_snapshot(),
             )
+
+        self._runner_pending_sessions[runner_name] = self._runner_pending_sessions.get(runner_name, 0) + 1
+        self._log_runner_concurrency(
+            runner_name=runner_name,
+            runner_cap=runner_cap,
+            event="wait_semaphore",
+            sample_index=sample_index,
+            session_index=session_index,
+            force=getattr(runner_semaphore, "_value", None) == 0,
+        )
+        entered_semaphore = False
+        try:
+            async with runner_semaphore:
+                entered_semaphore = True
+                self._runner_pending_sessions[runner_name] -= 1
+                self._runner_active_sessions[runner_name] = self._runner_active_sessions.get(runner_name, 0) + 1
+                self._runner_peak_sessions[runner_name] = max(
+                    self._runner_peak_sessions.get(runner_name, 0),
+                    self._runner_active_sessions[runner_name],
+                )
+                self._log_runner_concurrency(
+                    runner_name=runner_name,
+                    runner_cap=runner_cap,
+                    event="enter_semaphore",
+                    sample_index=sample_index,
+                    session_index=session_index,
+                )
+                try:
+                    return await self._run_session(
+                        sample_fields=sample_fields,
+                        sample_index=sample_index,
+                        session_index=session_index,
+                        runner_name=runner_name,
+                        runner_config=runner_config,
+                    )
+                finally:
+                    self._runner_active_sessions[runner_name] -= 1
+                    self._log_runner_concurrency(
+                        runner_name=runner_name,
+                        runner_cap=runner_cap,
+                        event="exit_semaphore",
+                        sample_index=sample_index,
+                        session_index=session_index,
+                    )
+        finally:
+            if not entered_semaphore:
+                self._runner_pending_sessions[runner_name] -= 1
+                self._log_runner_concurrency(
+                    runner_name=runner_name,
+                    runner_cap=runner_cap,
+                    event="cancel_wait_semaphore",
+                    sample_index=sample_index,
+                    session_index=session_index,
+                    force=True,
+                )
 
     async def _run_session(
         self,
@@ -490,11 +693,13 @@ class OpenAICompatibleAgentFramework(AgentFramework):
                 # Ray workers run only the runner. Gateway token truth,
                 # finalization, reward scoring, and TQ writes stay in parent.
                 object_ref = _run_agent_runner_ray_task.remote(
+                    runner_name=runner_name,
                     runner_fqn=runner_config.runner_fqn,
                     runner_kwargs=runner_config.runner_kwargs,
                     raw_prompt=raw_prompt,
                     session=session,
                     sample_index=sample_index,
+                    session_index=session_index,
                     tools_kwargs=tools_kwargs,
                 )
                 await object_ref
@@ -674,8 +879,12 @@ class OpenAICompatibleAgentFramework(AgentFramework):
 
         prompt_len = prompts.size(0)
         response_len = responses.size(0)
+        min_global_steps = trajectory.extra_fields.get("min_global_steps", global_steps)
+        max_global_steps = trajectory.extra_fields.get("max_global_steps", global_steps)
         tag = {
             "global_steps": global_steps,
+            "min_global_steps": global_steps if min_global_steps is None else min_global_steps,
+            "max_global_steps": global_steps if max_global_steps is None else max_global_steps,
             "status": "success",
             "prompt_len": prompt_len,
             "response_len": response_len,
