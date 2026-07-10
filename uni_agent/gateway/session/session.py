@@ -12,9 +12,8 @@ from typing import Any
 
 from fastapi import HTTPException
 
-from uni_agent.gateway.session.codec import MalformedRequestError, MessageCodec
-from uni_agent.gateway.session.types import SessionHandle, Trajectory
-
+from uni_agent.gateway.session.codec import MessageCodec
+from uni_agent.gateway.session.types import InternalGenerationRequest, SessionHandle, Trajectory
 
 _EMPTY_PREFIX_HASH = hashlib.sha256(b"uni-agent-prefix-v1\0empty").hexdigest()
 
@@ -60,6 +59,7 @@ class ChainState:
     message_history: list[dict[str, Any]]
     message_prefix_hashes: list[str]
     active_tool_schemas: list[dict[str, Any]] | None
+    effective_chat_template_kwargs: dict[str, Any]
     buffer: TrajectoryBuffer
     image_data: list[Any] | None
     video_data: list[Any] | None
@@ -120,6 +120,8 @@ class EncodedData:
         selected_updated_seq: Selected active chain updated sequence at prepare time.
         selected_created_seq: Selected active chain created sequence at prepare time.
         is_new_chain: Whether commit should append a new chain.
+        effective_chat_template_kwargs: Effective chat-template kwargs used for
+            chain compatibility and encoding.
         incoming_message_prefix_hashes: Stable prefix hashes for the normalized
             request history.
         logprobs_complete: Whether response logprobs are still complete for the
@@ -141,6 +143,7 @@ class EncodedData:
     selected_updated_seq: int | None = None
     selected_created_seq: int | None = None
     is_new_chain: bool = False
+    effective_chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     incoming_message_prefix_hashes: list[str] = field(default_factory=list)
     logprobs_complete: bool = True
 
@@ -150,7 +153,7 @@ class GenerationOutcome:
     """Business result returned by ``GatewaySession.run_generation``.
 
     The session emits this instead of an HTTP response dict. ``_GatewayActor``
-    converts it into the OpenAI chat-completion JSON envelope.
+    passes it to the provider adapter for wire response serialization.
 
     Attributes:
         assistant_msg: Decoded assistant message, or an empty assistant message
@@ -171,8 +174,8 @@ class GatewaySession:
 
     ``_GatewayActor`` owns instances of this class, calls ``run_generation`` for
     chat requests, and delegates lifecycle operations here. The session owns the
-    conversation state and trajectory materialization, while the actor owns HTTP
-    routing and OpenAI response serialization.
+    conversation state and trajectory materialization, while the actor owns
+    HTTP routing and provider response serialization.
     """
 
     def __init__(
@@ -212,34 +215,30 @@ class GatewaySession:
         # Default runtime keeps M1 serialization. M2 parallelism is opt-in.
         self.generation_lock = asyncio.Lock()
 
-    async def run_generation(self, payload: dict[str, Any], backend) -> GenerationOutcome:
-        """Run one chat-completion request and return its business outcome.
+    async def run_generation(self, request: InternalGenerationRequest, backend) -> GenerationOutcome:
+        """Run one provider-normalized generation request and return its business outcome.
 
         The backend is passed in for this call only; the session does not own the
-        backend lifecycle. Protocol capability checks happen in the actor before
-        this method, while malformed payloads and backend errors are converted
-        into HTTP exceptions here.
+        backend lifecycle. The actor/provider adapter has already lowered the
+        wire payload to the internal canonical request; session never sees raw
+        wire payloads. Protocol capability checks happen in the actor before
+        this method, while backend errors are converted into HTTP exceptions
+        here.
         """
-        try:
-            request_context = self._codec.normalize_request(payload)
-        except MalformedRequestError as exc:
-            raise HTTPException(status_code=400, detail=str(exc)) from exc
-
         # M2 parallel mode commits in backend completion order, so same-session
         # concurrent sampling can produce unstable trajectory ordering even for
         # best-of-N-style workloads. The framework currently scores
         # session_trajectories[-1] and broadcasts that reward, so enable this
         # only when same-session siblings can safely share one reward target.
         if self._enable_parallel_session_generation:
-            return await self._run_generation_prepared(payload, request_context, backend)
+            return await self._run_generation_prepared(request, backend)
 
         async with self.generation_lock:
-            return await self._run_generation_prepared(payload, request_context, backend)
+            return await self._run_generation_prepared(request, backend)
 
     async def _run_generation_prepared(
         self,
-        payload: dict[str, Any],
-        request_context: dict[str, Any],
+        request: InternalGenerationRequest,
         backend,
     ) -> GenerationOutcome:
         encoded: EncodedData | None = None
@@ -252,7 +251,7 @@ class GatewaySession:
                     )
                 # Prepare can touch codec and multimodal extractor state; M2 only
                 # parallelizes backend generation, not request preparation.
-                encoded = await self._prepare_generation_inputs(payload, request_context)
+                encoded = await self._prepare_generation_inputs(request)
                 if encoded.length_exhausted_trajectory is not None:
                     empty_msg = {"role": "assistant", "content": ""}
                     self._close_length_exhausted_chain(encoded)
@@ -313,16 +312,15 @@ class GatewaySession:
             if encoded is not None and encoded.generation_id is not None:
                 await asyncio.shield(self._cleanup_inflight_generation(encoded.generation_id))
 
-    async def _prepare_generation_inputs(
-        self,
-        payload: dict[str, Any],
-        request_context: dict[str, Any],
-    ) -> EncodedData:
-        messages = request_context["messages"]
-        tools = request_context["tools"]
+    async def _prepare_generation_inputs(self, request: InternalGenerationRequest) -> EncodedData:
+        messages = request["messages"]
+        tools = request["tools"]
+        request_chat_template_kwargs = request["chat_template_kwargs"]
+        effective_chat_template_kwargs = self._codec.effective_chat_template_kwargs(request_chat_template_kwargs)
         incoming_message_prefix_hashes = self._compute_message_prefix_hashes(messages)
         selected_chain = self._select_chain(
             tools=tools,
+            effective_chat_template_kwargs=effective_chat_template_kwargs,
             incoming_message_prefix_hashes=incoming_message_prefix_hashes,
         )
 
@@ -333,6 +331,7 @@ class GatewaySession:
                 tools=tools,
                 image_data=image_data,
                 video_data=video_data,
+                request_chat_template_kwargs=request_chat_template_kwargs,
             )
             buffer = TrajectoryBuffer(prompt_ids=prompt_ids)
             is_new_chain = True
@@ -361,6 +360,7 @@ class GatewaySession:
                     incremental_messages,
                     image_data=new_image_data,
                     video_data=new_video_data,
+                    request_chat_template_kwargs=request_chat_template_kwargs,
                 )
                 if (
                     self._response_length is not None
@@ -377,7 +377,7 @@ class GatewaySession:
                         video_data=video_data,
                         length_exhausted_trajectory=self._build_materialized_trajectory(
                             chain=selected_chain,
-                            extra_fields={"finish_reason": "length"},
+                            extra_fields={"materialization_reason": "max_response_length"},
                         ),
                         selected_chain_id=selected_chain.chain_id,
                         selected_tip_hash=selected_tip_hash,
@@ -385,6 +385,7 @@ class GatewaySession:
                         selected_updated_seq=selected_updated_seq,
                         selected_created_seq=selected_created_seq,
                         is_new_chain=False,
+                        effective_chat_template_kwargs=effective_chat_template_kwargs,
                         incoming_message_prefix_hashes=list(incoming_message_prefix_hashes),
                         logprobs_complete=logprobs_complete,
                     )
@@ -402,7 +403,7 @@ class GatewaySession:
                     video_data.extend(new_video_data)
 
         context_ids = buffer.prompt_ids + buffer.response_ids
-        sampling_params = self._codec.build_sampling_params(payload)
+        sampling_params = dict(request["sampling_params"])
         remaining_response_budget = (
             max(0, self._response_length - len(buffer.response_mask)) if self._response_length is not None else None
         )
@@ -423,6 +424,7 @@ class GatewaySession:
             selected_updated_seq=selected_updated_seq,
             selected_created_seq=selected_created_seq,
             is_new_chain=is_new_chain,
+            effective_chat_template_kwargs=effective_chat_template_kwargs,
             incoming_message_prefix_hashes=list(incoming_message_prefix_hashes),
             logprobs_complete=logprobs_complete,
         )
@@ -477,9 +479,7 @@ class GatewaySession:
             "num_active_chains": len(self.active_chains),
             "active_chain_ids": [chain.chain_id for chain in self.active_chains],
             "active_chain_tip_hashes": {
-                chain.chain_id: (
-                    chain.message_prefix_hashes[-1] if chain.message_prefix_hashes else _EMPTY_PREFIX_HASH
-                )
+                chain.chain_id: (chain.message_prefix_hashes[-1] if chain.message_prefix_hashes else _EMPTY_PREFIX_HASH)
                 for chain in self.active_chains
             },
             "active_chain_updated_seq": {chain.chain_id: chain.updated_seq for chain in self.active_chains},
@@ -491,6 +491,7 @@ class GatewaySession:
         self,
         *,
         tools: list[dict[str, Any]] | None,
+        effective_chat_template_kwargs: dict[str, Any],
         incoming_message_prefix_hashes: list[str],
     ) -> ChainState | None:
         candidates = [
@@ -499,6 +500,7 @@ class GatewaySession:
             if self._is_chain_request_compatible(
                 chain=chain,
                 tools=tools,
+                effective_chat_template_kwargs=effective_chat_template_kwargs,
             )
             and self._is_chain_prefix_hash_match(
                 chain=chain,
@@ -514,8 +516,12 @@ class GatewaySession:
         *,
         chain: ChainState,
         tools: list[dict[str, Any]] | None,
+        effective_chat_template_kwargs: dict[str, Any],
     ) -> bool:
-        return chain.active_tool_schemas == tools
+        return (
+            chain.active_tool_schemas == tools
+            and chain.effective_chat_template_kwargs == effective_chat_template_kwargs
+        )
 
     def _is_chain_prefix_hash_match(
         self,
@@ -545,10 +551,7 @@ class GatewaySession:
         for message in new_messages:
             message_hash = self._compute_message_hash(message)
             prefix_hash = hashlib.sha256(
-                b"uni-agent-prefix-v1\0"
-                + previous_prefix_hash.encode("ascii")
-                + b"\0"
-                + message_hash.encode("ascii")
+                b"uni-agent-prefix-v1\0" + previous_prefix_hash.encode("ascii") + b"\0" + message_hash.encode("ascii")
             ).hexdigest()
             prefix_hashes.append(prefix_hash)
             previous_prefix_hash = prefix_hash
@@ -614,6 +617,7 @@ class GatewaySession:
                     message_history=message_history,
                     message_prefix_hashes=message_prefix_hashes,
                     active_tool_schemas=encoded.tools,
+                    effective_chat_template_kwargs=dict(encoded.effective_chat_template_kwargs),
                     buffer=encoded.buffer,
                     image_data=self._copy_media_list(encoded.image_data),
                     video_data=self._copy_media_list(encoded.video_data),
@@ -635,6 +639,7 @@ class GatewaySession:
                     message_history=message_history,
                     message_prefix_hashes=message_prefix_hashes,
                     active_tool_schemas=encoded.tools,
+                    effective_chat_template_kwargs=dict(encoded.effective_chat_template_kwargs),
                     buffer=encoded.buffer,
                     image_data=self._copy_media_list(encoded.image_data),
                     video_data=self._copy_media_list(encoded.video_data),
@@ -651,6 +656,7 @@ class GatewaySession:
             message_history=message_history,
             message_prefix_hashes=message_prefix_hashes,
             active_tool_schemas=encoded.tools,
+            effective_chat_template_kwargs=dict(encoded.effective_chat_template_kwargs),
             buffer=encoded.buffer,
             image_data=self._copy_media_list(encoded.image_data),
             video_data=self._copy_media_list(encoded.video_data),

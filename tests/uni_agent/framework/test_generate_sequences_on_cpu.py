@@ -12,6 +12,15 @@ _RUNNER_CALLS = []
 _TEST_INLINE_RUNNERS = {}
 
 
+def _internal_request(messages):
+    return {
+        "messages": messages,
+        "tools": None,
+        "chat_template_kwargs": {},
+        "sampling_params": {},
+    }
+
+
 async def _config_recording_runner(*, raw_prompt, session, sample_index, marker=None, **kwargs):
     _RUNNER_CALLS.append(
         {
@@ -394,7 +403,12 @@ async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch,
     session and trainer-compatible trajectory fields."""
     runtime = _FakeGatewayManager(
         {
-            "session-0-0": [_trajectory(response_logprobs=[-0.1, -0.2], extra_fields={"finish_reason": "length"})],
+            "session-0-0": [
+                _trajectory(
+                    response_logprobs=[-0.1, -0.2],
+                    extra_fields={"materialization_reason": "max_response_length"},
+                )
+            ],
             "session-0-1": [_trajectory(response_logprobs=[-0.3, -0.4])],
         }
     )
@@ -425,7 +439,15 @@ async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch,
     tag = first["tags"][0]
     assert {
         key: tag[key]
-        for key in ("global_steps", "status", "prompt_len", "response_len", "seq_len", "uid", "finish_reason")
+        for key in (
+            "global_steps",
+            "status",
+            "prompt_len",
+            "response_len",
+            "seq_len",
+            "uid",
+            "materialization_reason",
+        )
     } == {
         "global_steps": 7,
         "status": "success",
@@ -433,10 +455,11 @@ async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch,
         "response_len": 2,
         "seq_len": 4,
         "uid": "uid-0",
-        "finish_reason": "length",
+        "materialization_reason": "max_response_length",
     }
     assert "length_truncated" not in tag
     assert "traj_exit_reason" not in tag
+    assert "materialization_reason" not in fields
     assert fields["input_ids"].is_nested
     assert fields["response_mask"].is_nested
     assert fields["position_ids"].is_nested
@@ -483,7 +506,9 @@ async def test_generate_sequences_preserves_sorted_trajectory_order_and_rewards_
         def decode(self, token_ids, skip_special_tokens=True):
             if hasattr(token_ids, "tolist"):
                 token_ids = token_ids.tolist()
-            return "".join(chr(int(token_id.item() if hasattr(token_id, "item") else token_id)) for token_id in token_ids)
+            return "".join(
+                chr(int(token_id.item() if hasattr(token_id, "item") else token_id)) for token_id in token_ids
+            )
 
         def encode(self, text, add_special_tokens=False):
             return [ord(char) for char in text]
@@ -537,16 +562,16 @@ async def test_generate_sequences_preserves_sorted_trajectory_order_and_rewards_
         {"role": "user", "content": "too long"},
     ]
 
-    await real_session.run_generation({"model": "dummy-model", "messages": main_first}, backend)
-    await real_session.run_generation({"model": "dummy-model", "messages": subagent}, backend)
-    outcome = await real_session.run_generation({"model": "dummy-model", "messages": main_too_long}, backend)
+    await real_session.run_generation(_internal_request(main_first), backend)
+    await real_session.run_generation(_internal_request(subagent), backend)
+    outcome = await real_session.run_generation(_internal_request(main_too_long), backend)
     await real_session.set_reward_info({"branch": "main", "target": "final-main"})
     trajectories = await real_session.finalize()
 
     assert outcome.finish_reason == "length"
     assert backend.steps == []
     assert [tokenizer.decode(trajectory.response_ids) for trajectory in trajectories] == ["SUB", "MAIN1"]
-    assert trajectories[-1].extra_fields == {"finish_reason": "length"}
+    assert trajectories[-1].extra_fields == {"materialization_reason": "max_response_length"}
     runtime = _FakeGatewayManager({"session-0-0": trajectories})
     framework = await _build_framework_with_agent_runners(
         agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
@@ -563,15 +588,16 @@ async def test_generate_sequences_preserves_sorted_trajectory_order_and_rewards_
     final_trajectory = trajectories[-1]
     assert data.batch["prompts"].tolist() == [final_trajectory.prompt_ids]
     assert data.batch["responses"].tolist() == [final_trajectory.response_ids]
-    assert data.non_tensor_batch["extra_info"].tolist() == [
-        {"index": 0, "branch": "main", "target": "final-main"}
-    ]
+    assert data.non_tensor_batch["extra_info"].tolist() == [{"index": 0, "branch": "main", "target": "final-main"}]
     assert data.non_tensor_batch["__num_turns__"].tolist() == [final_trajectory.num_turns]
 
     assert len(fake_tq.batch_puts) == 1
     batch_put = fake_tq.batch_puts[0]
     assert batch_put["keys"] == ["uid-0_0_0", "uid-0_0_1"]
-    assert [tag.get("finish_reason") for tag in batch_put["tags"]] == [None, "length"]
+    assert [tag.get("materialization_reason") for tag in batch_put["tags"]] == [
+        None,
+        "max_response_length",
+    ]
     fields = batch_put["fields"]
     assert [fields["prompts"][i].tolist() for i in range(len(trajectories))] == [
         trajectory.prompt_ids for trajectory in trajectories
@@ -612,7 +638,9 @@ async def test_generate_sequences_preserves_normal_multiple_chain_order_and_rewa
         def decode(self, token_ids, skip_special_tokens=True):
             if hasattr(token_ids, "tolist"):
                 token_ids = token_ids.tolist()
-            return "".join(chr(int(token_id.item() if hasattr(token_id, "item") else token_id)) for token_id in token_ids)
+            return "".join(
+                chr(int(token_id.item() if hasattr(token_id, "item") else token_id)) for token_id in token_ids
+            )
 
         def encode(self, text, add_special_tokens=False):
             return [ord(char) for char in text]
@@ -675,9 +703,9 @@ async def test_generate_sequences_preserves_normal_multiple_chain_order_and_rewa
     ]
 
     outcomes = [
-        await real_session.run_generation({"model": "dummy-model", "messages": main_first}, backend),
-        await real_session.run_generation({"model": "dummy-model", "messages": subagent}, backend),
-        await real_session.run_generation({"model": "dummy-model", "messages": main_continuation}, backend),
+        await real_session.run_generation(_internal_request(main_first), backend),
+        await real_session.run_generation(_internal_request(subagent), backend),
+        await real_session.run_generation(_internal_request(main_continuation), backend),
     ]
     await real_session.set_reward_info({"branch": "main", "target": "final-main"})
     trajectories = await real_session.finalize()
@@ -710,9 +738,7 @@ async def test_generate_sequences_preserves_normal_multiple_chain_order_and_rewa
     final_trajectory = trajectories[-1]
     assert data.batch["prompts"].tolist() == [final_trajectory.prompt_ids]
     assert data.batch["responses"].tolist() == [final_trajectory.response_ids]
-    assert data.non_tensor_batch["extra_info"].tolist() == [
-        {"index": 0, "branch": "main", "target": "final-main"}
-    ]
+    assert data.non_tensor_batch["extra_info"].tolist() == [{"index": 0, "branch": "main", "target": "final-main"}]
     assert data.non_tensor_batch["__num_turns__"].tolist() == [final_trajectory.num_turns]
 
     assert len(fake_tq.batch_puts) == 1
@@ -761,7 +787,10 @@ async def test_multiple_chains_tq_writes_preserve_sorted_trajectory_order(fake_t
     # last. Distinct response_ids and a marker tag let us prove each key maps to
     # the right chain and that the write preserves order rather than re-deriving it.
     subagent = _trajectory(response_ids=[201, 202])
-    final_main = _trajectory(response_ids=[211, 212, 213], extra_fields={"finish_reason": "length"})
+    final_main = _trajectory(
+        response_ids=[211, 212, 213],
+        extra_fields={"materialization_reason": "max_response_length"},
+    )
     trajectories = [subagent, final_main]
 
     await framework._write_session_trajectories_to_tq(
@@ -782,8 +811,8 @@ async def test_multiple_chains_tq_writes_preserve_sorted_trajectory_order(fake_t
     assert fields["responses"][0].tolist() == subagent.response_ids
     assert fields["responses"][1].tolist() == final_main.response_ids
     # Highest-order_seq chain (final_main) lands on the last key, carrying its marker tag.
-    assert batch_put["tags"][0].get("finish_reason") is None
-    assert batch_put["tags"][1].get("finish_reason") == "length"
+    assert batch_put["tags"][0].get("materialization_reason") is None
+    assert batch_put["tags"][1].get("materialization_reason") == "max_response_length"
 
 
 @pytest.mark.asyncio
@@ -1003,7 +1032,7 @@ async def test_score_trajectories_uses_last_finalized_trajectory_as_reward_targe
         response_ids=[20],
         response_mask=[1],
         reward_info={"branch": "main", "finish_reason": "length"},
-        extra_fields={"finish_reason": "length"},
+        extra_fields={"materialization_reason": "max_response_length"},
     )
 
     annotations = await framework._score_trajectories(
@@ -1015,7 +1044,5 @@ async def test_score_trajectories_uses_last_finalized_trajectory_as_reward_targe
     data = worker.compute_score.calls[0]
     assert data.batch["prompts"].tolist() == [[10]]
     assert data.batch["responses"].tolist() == [[20]]
-    assert data.non_tensor_batch["extra_info"].tolist() == [
-        {"branch": "main", "finish_reason": "length"}
-    ]
+    assert data.non_tensor_batch["extra_info"].tolist() == [{"branch": "main", "finish_reason": "length"}]
     assert annotations == [(0.7, {"target": "main"}), (0.7, {"target": "main"})]
