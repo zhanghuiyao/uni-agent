@@ -742,6 +742,24 @@ async def test_multiple_chains_sets_remaining_budget_when_request_omits_max_toke
     assert backend.calls[0]["sampling_params"]["max_tokens"] == 10
 
 
+@pytest.mark.parametrize("max_tokens", [0, -1, None, "1", 1.5, True])
+@pytest.mark.asyncio
+async def test_multiple_chains_rejects_invalid_request_max_tokens_before_backend_call(max_tokens):
+    session = _session("invalid-request-max-tokens")
+    backend = SequencedBackend(["SHOULD_NOT_RUN"])
+
+    with pytest.raises(HTTPException, match="max_tokens must be a positive integer") as exc_info:
+        await _run(
+            session,
+            backend,
+            [{"role": "user", "content": "invalid request max_tokens"}],
+            max_tokens=max_tokens,
+        )
+
+    assert exc_info.value.status_code == 400
+    assert backend.calls == []
+
+
 @pytest.mark.asyncio
 async def test_multiple_chains_multimodal_media_stays_chain_local():
     """Keep image media isolated between independently selected chains."""

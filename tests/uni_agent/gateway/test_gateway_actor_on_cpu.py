@@ -285,10 +285,9 @@ def test_prefix_canonicalization_ignores_provider_ids_and_normalizes_arguments()
             == codec.canonicalize_message_for_prefix_comparison(msg_b)
         ) is expect_equal
 
-
 @pytest.mark.asyncio
-async def test_request_chat_template_kwargs_forwarded(monkeypatch):
-    """Request chat-template kwargs override codec defaults for one request."""
+async def test_config_chat_template_kwargs_forwarded(monkeypatch):
+    """Codec-level chat-template kwargs are copied and forwarded."""
     import uni_agent.gateway.session.codec as codec_mod
     from uni_agent.gateway.config import GatewayActorConfig
     from uni_agent.gateway.gateway import _GatewayActor
@@ -318,15 +317,35 @@ async def test_request_chat_template_kwargs_forwarded(monkeypatch):
             "s1",
             {
                 "messages": [{"role": "user", "content": "hi"}],
-                "chat_template_kwargs": {"enable_thinking": True, "extra_flag": "x"},
             },
         )
 
-        assert captured_kwargs["enable_thinking"] is True
+        assert captured_kwargs["enable_thinking"] is False
         assert captured_kwargs["default_only"] == "kept"
-        assert captured_kwargs["extra_flag"] == "x"
     finally:
         await actor.shutdown()
+
+
+@pytest.mark.asyncio
+async def test_gateway_actor_rejects_invalid_session_max_tokens_before_backend_call():
+    from fastapi import HTTPException
+
+    from uni_agent.gateway.config import GatewayActorConfig
+    from uni_agent.gateway.gateway import _GatewayActor
+
+    backend = SequencedBackend(["SHOULD_NOT_RUN"])
+    actor = _GatewayActor(GatewayActorConfig(tokenizer=FakeTokenizer()), backend)
+    actor._server_base_url = "http://gateway.local"
+    await actor.create_session("invalid-session-max-tokens", sampling_params={"max_tokens": 0})
+
+    with pytest.raises(HTTPException, match="max_tokens must be a positive integer") as exc_info:
+        await actor._handle_openai_chat_completions(
+            "invalid-session-max-tokens",
+            {"messages": [{"role": "user", "content": "invalid session max_tokens"}]},
+        )
+
+    assert exc_info.value.status_code == 400
+    assert backend.calls == []
 
 
 @pytest.mark.asyncio
@@ -1156,13 +1175,27 @@ async def test_gateway_actor_parallel_same_session_requests_by_default():
             },
             "tools must be a list",
         ),
+        (
+            {
+                "model": "dummy-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "chat_template_kwargs": {},
+            },
+            "request-level chat_template_kwargs is not supported",
+        ),
+        (
+            {
+                "model": "dummy-model",
+                "messages": [{"role": "user", "content": "hello"}],
+                "max_tokens": 0,
+            },
+            "max_tokens must be a positive integer",
+        ),
     ],
 )
 @pytest.mark.asyncio
 async def test_gateway_actor_rejects_malformed_requests_with_bad_request(ray_runtime, payload, detail_fragment):
-    """Malformed request payloads (empty messages, bad types, invalid
-    tool_calls/tools structure) are rejected with HTTP 400 and an
-    OpenAI-style error envelope."""
+    """Malformed request payloads are rejected with HTTP 400 and an OpenAI-style error envelope."""
     from uni_agent.gateway.config import GatewayActorConfig
     from uni_agent.gateway.gateway import GatewayActor
 

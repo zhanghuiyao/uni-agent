@@ -289,6 +289,11 @@ class GatewaySession:
         tools = request["tools"]
         request_chat_template_kwargs = request["chat_template_kwargs"]
         effective_chat_template_kwargs = self._codec.effective_chat_template_kwargs(request_chat_template_kwargs)
+        sampling_params = dict(request["sampling_params"])
+        if "max_tokens" in sampling_params:
+            max_tokens = sampling_params["max_tokens"]
+            if not isinstance(max_tokens, int) or isinstance(max_tokens, bool) or max_tokens <= 0:
+                raise HTTPException(status_code=400, detail="max_tokens must be a positive integer")
         incoming_message_prefix_hashes = self._compute_message_prefix_hashes(messages)
         selected_chain = self._select_chain(
             tools=tools,
@@ -364,7 +369,6 @@ class GatewaySession:
                     video_data.extend(new_video_data)
 
         context_ids = buffer.prompt_ids + buffer.response_ids
-        sampling_params = dict(request["sampling_params"])
         remaining_response_budget = (
             max(0, self._response_length - len(buffer.response_mask)) if self._response_length is not None else None
         )

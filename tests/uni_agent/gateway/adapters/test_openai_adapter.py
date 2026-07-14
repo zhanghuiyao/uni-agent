@@ -127,3 +127,32 @@ def test_openai_to_internal_normalizes_messages_sampling_and_tools():
         allowed_sampling_keys=ALLOWED_SAMPLING_KEYS,
     )
     assert without_tools["tools"] is None
+
+
+@pytest.mark.parametrize("payload_extra", [{}, {"chat_template_kwargs": None}])
+def test_openai_to_internal_accepts_absent_or_null_chat_template_kwargs(payload_extra):
+    from uni_agent.gateway.adapters.openai import openai_to_internal
+
+    request = openai_to_internal(
+        {"messages": [{"role": "user", "content": "hi"}], **payload_extra},
+        base_sampling_params={},
+        allowed_sampling_keys=ALLOWED_SAMPLING_KEYS,
+    )
+
+    assert request["chat_template_kwargs"] == {}
+
+
+@pytest.mark.parametrize("chat_template_kwargs", [{}, {"enable_thinking": True}, "unsupported"])
+def test_openai_to_internal_rejects_non_null_chat_template_kwargs(chat_template_kwargs):
+    from uni_agent.gateway.adapters import MalformedRequestError
+    from uni_agent.gateway.adapters.openai import openai_to_internal
+
+    with pytest.raises(MalformedRequestError, match="request-level chat_template_kwargs is not supported"):
+        openai_to_internal(
+            {
+                "messages": [{"role": "user", "content": "hi"}],
+                "chat_template_kwargs": chat_template_kwargs,
+            },
+            base_sampling_params={},
+            allowed_sampling_keys=ALLOWED_SAMPLING_KEYS,
+        )

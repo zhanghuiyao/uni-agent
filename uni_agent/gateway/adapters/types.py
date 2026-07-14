@@ -56,9 +56,9 @@ class OpenAIChatCompletionTool(TypedDict, total=False):
 class OpenAIChatCompletionRequest(TypedDict, total=False):
     """Incoming ``POST /v1/chat/completions`` request body shape.
 
-    ``chat_template_kwargs`` is an OpenAI-compatible server extension used by
-    the gateway to forward per-request chat template overrides (e.g.
-    ``enable_thinking``) into ``MessageCodec``.
+    ``chat_template_kwargs`` is included only so the adapter can reject the
+    unsupported request-level extension. Chat-template options are configured
+    at the gateway/model level.
     """
 
     model: str
