@@ -63,7 +63,6 @@ class ChainState:
     buffer: TrajectoryBuffer
     image_data: list[Any] | None
     video_data: list[Any] | None
-    logprobs_complete: bool
     created_seq: int
     updated_seq: int
 
@@ -104,8 +103,6 @@ class EncodedData:
             chain compatibility and encoding.
         incoming_message_prefix_hashes: Stable prefix hashes for the normalized
             request history.
-        logprobs_complete: Whether response logprobs are still complete for the
-            working chain.
     """
 
     buffer: TrajectoryBuffer
@@ -119,7 +116,6 @@ class EncodedData:
     chain_id: int | None
     effective_chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     incoming_message_prefix_hashes: list[str] = field(default_factory=list)
-    logprobs_complete: bool = True
 
 
 @dataclass
@@ -250,7 +246,16 @@ class GatewaySession:
             response_ids = list(output.token_ids)
             encoded.buffer.response_ids.extend(response_ids)
             encoded.buffer.response_mask.extend([1] * len(response_ids))
-            self._append_output_logprobs(encoded, output.log_probs, response_ids)
+            if encoded.sampling_params.get("logprobs", False):
+                if output.log_probs is None:
+                    raise RuntimeError("backend omitted logprobs when requested")
+                log_probs = list(output.log_probs)
+                if len(log_probs) != len(response_ids):
+                    raise RuntimeError(
+                        "backend logprobs must align with token_ids: "
+                        f"got {len(log_probs)} logprobs for {len(response_ids)} tokens"
+                    )
+                encoded.buffer.response_logprobs.extend(log_probs)
 
             async with self.request_lock:
                 if self.phase != SessionPhase.ACTIVE:
@@ -311,12 +316,10 @@ class GatewaySession:
                 request_chat_template_kwargs=request_chat_template_kwargs,
             )
             buffer = TrajectoryBuffer(prompt_ids=prompt_ids)
-            logprobs_complete = True
             chain_id = None
         else:
             buffer = self._copy_trajectory_buffer(selected_chain.buffer)
             image_data, video_data = self._copy_chain_media(selected_chain)
-            logprobs_complete = selected_chain.logprobs_complete
             chain_id = selected_chain.chain_id
             incremental_messages = messages[len(selected_chain.message_history) :]
             new_image_data = None
@@ -351,13 +354,12 @@ class GatewaySession:
                     chain_id=selected_chain.chain_id,
                     effective_chat_template_kwargs=effective_chat_template_kwargs,
                     incoming_message_prefix_hashes=list(incoming_message_prefix_hashes),
-                    logprobs_complete=logprobs_complete,
                 )
 
             if incremental_messages:
                 buffer.response_ids.extend(incremental_ids)
                 buffer.response_mask.extend([0] * len(incremental_ids))
-                if logprobs_complete:
+                if sampling_params.get("logprobs", False):
                     buffer.response_logprobs.extend([0.0] * len(incremental_ids))
                 if new_image_data:
                     if image_data is None:
@@ -389,7 +391,6 @@ class GatewaySession:
             chain_id=chain_id,
             effective_chat_template_kwargs=effective_chat_template_kwargs,
             incoming_message_prefix_hashes=list(incoming_message_prefix_hashes),
-            logprobs_complete=logprobs_complete,
         )
 
     async def set_reward_info(self, reward_info: dict[str, Any] | None = None) -> None:
@@ -549,22 +550,6 @@ class GatewaySession:
         # Copy only the container; media payloads may not be deepcopyable.
         return list(media) if media is not None else None
 
-    def _append_output_logprobs(
-        self,
-        encoded: EncodedData,
-        output_log_probs: list[float] | None,
-        response_ids: list[int],
-    ) -> None:
-        if output_log_probs is None:
-            encoded.logprobs_complete = False
-            return
-        log_probs = list(output_log_probs)
-        if len(log_probs) != len(response_ids):
-            encoded.logprobs_complete = False
-            return
-        if encoded.logprobs_complete:
-            encoded.buffer.response_logprobs.extend(log_probs)
-
     def _commit_generation_to_chain(self, encoded: EncodedData, assistant_msg: dict[str, Any]) -> None:
         message_history = list(encoded.messages) + [assistant_msg]
         message_prefix_hashes = self._extend_message_prefix_hashes(
@@ -585,7 +570,6 @@ class GatewaySession:
                     buffer=encoded.buffer,
                     image_data=self._copy_media_list(encoded.image_data),
                     video_data=self._copy_media_list(encoded.video_data),
-                    logprobs_complete=encoded.logprobs_complete,
                     created_seq=order_seq,
                     updated_seq=order_seq,
                 )
@@ -603,7 +587,6 @@ class GatewaySession:
             buffer=encoded.buffer,
             image_data=self._copy_media_list(encoded.image_data),
             video_data=self._copy_media_list(encoded.video_data),
-            logprobs_complete=encoded.logprobs_complete,
             created_seq=previous_chain.created_seq,
             updated_seq=order_seq,
         )
@@ -663,7 +646,7 @@ class GatewaySession:
         extra_fields: dict[str, Any] | None = None,
     ) -> Trajectory:
         response_logprobs = None
-        if chain.logprobs_complete and len(chain.buffer.response_logprobs) == len(chain.buffer.response_ids):
+        if chain.buffer.response_logprobs and len(chain.buffer.response_logprobs) == len(chain.buffer.response_ids):
             response_logprobs = list(chain.buffer.response_logprobs)
         return Trajectory(
             prompt_ids=list(chain.buffer.prompt_ids),
