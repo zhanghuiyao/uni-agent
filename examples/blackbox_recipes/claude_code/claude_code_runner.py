@@ -91,7 +91,12 @@ def _decode_metadata_list(value) -> list[str]:
     return [str(value)]
 
 
-def build_claude_task(raw_prompt, tools_kwargs: dict | None = None) -> str:
+def build_claude_task(
+    raw_prompt,
+    tools_kwargs: dict | None = None,
+    *,
+    require_subagent: bool = False,
+) -> str:
     tools_kwargs = tools_kwargs or {}
     task = extract_task(raw_prompt)
     metadata = (tools_kwargs.get("reward") or {}).get("metadata") or {}
@@ -101,6 +106,13 @@ def build_claude_task(raw_prompt, tools_kwargs: dict | None = None) -> str:
         tests = _decode_metadata_list(metadata.get("PASS_TO_PASS"))[:3]
     tests_block = (
         "\n".join(f"- {test}" for test in tests) if tests else "- Run the closest relevant tests you identify."
+    )
+
+    subagent_rule = (
+        "- Before making any changes, you MUST spawn at least one subagent to inspect the relevant code. Wait for "
+        "its result and explicitly use its findings in your solution.\n"
+        if require_subagent
+        else ""
     )
 
     return (
@@ -117,6 +129,7 @@ def build_claude_task(raw_prompt, tools_kwargs: dict | None = None) -> str:
         "fix.\n"
         "- Do not analyze unrelated `is_separable` behavior.\n"
         "- Do not run additional ad-hoc verification after the listed relevant pytest command passes.\n"
+        f"{subagent_rule}"
         "- Do not commit.\n"
         "- After the minimal fix is applied and a relevant pytest command passes, print a one-line summary and exit "
         "immediately.\n\n"
@@ -135,6 +148,7 @@ def build_claude_command(
     conda_env: str | None = "testbed",
     disable_web_tools: bool = True,
     disable_slash_commands: bool = True,
+    enable_subagents: bool = False,
 ) -> str:
     env = {
         "ANTHROPIC_BASE_URL": base_url,
@@ -146,7 +160,7 @@ def build_claude_command(
         "ANTHROPIC_SMALL_FAST_MODEL": model,
         "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-        "CLAUDE_CODE_FORK_SUBAGENT": "0",
+        "CLAUDE_CODE_FORK_SUBAGENT": "1" if enable_subagents else "0",
         "CLAUDE_CODE_SUBAGENT_MODEL": model,
         "DISABLE_AUTOUPDATER": "1",
         "IS_SANDBOX": "1",
@@ -175,8 +189,13 @@ def build_claude_command(
     ]
     if disable_slash_commands:
         argv.append("--disable-slash-commands")
+    disallowed_tools = []
+    if not enable_subagents:
+        disallowed_tools.extend(["Agent", "Task"])
     if disable_web_tools:
-        argv.extend(["--disallowedTools", "Agent", "Task", "WebFetch", "WebSearch"])
+        disallowed_tools.extend(["WebFetch", "WebSearch"])
+    if disallowed_tools:
+        argv.extend(["--disallowedTools", *disallowed_tools])
     return (
         "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy; "
         "cd /testbed; "
@@ -211,6 +230,8 @@ async def claude_code_runner(
     run_timeout: int = 7200,
     conda_env: str = "testbed",
     sandbox_max_retries: int = 10,
+    enable_subagents: bool = False,
+    require_subagent: bool = False,
     **kwargs,
 ) -> None:
     """Run Claude Code inside a sandbox with sidecar tool mount.
@@ -224,7 +245,10 @@ async def claude_code_runner(
     tools_kwargs = tools_kwargs or {}
     logger.info("claude_code_runner called, sample_index=%d", sample_index)
 
-    task = build_claude_task(raw_prompt, tools_kwargs)
+    if require_subagent and not enable_subagents:
+        raise ValueError("require_subagent=True requires enable_subagents=True")
+
+    task = build_claude_task(raw_prompt, tools_kwargs, require_subagent=require_subagent)
     env_config = tools_kwargs.get("env", {})
     image = extract_image(env_config)
     if not image:
@@ -259,6 +283,7 @@ async def claude_code_runner(
             base_url=claude_base_url,
             max_turns=max_turns,
             conda_env=conda_env,
+            enable_subagents=enable_subagents,
         )
 
         started_at = time.perf_counter()

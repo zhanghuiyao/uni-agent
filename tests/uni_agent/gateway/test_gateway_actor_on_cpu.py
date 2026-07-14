@@ -1556,6 +1556,136 @@ async def test_anthropic_tool_turn_round_trip_extends_not_reencodes(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_anthropic_claude_code_subagent_multiple_chains_return_to_main(monkeypatch):
+    """Model a native Claude Code Agent call, sidechain request, and tool-result return.
+
+    Billing header churn must not prevent the final main request from extending
+    its original chain, while the subagent remains a separate earlier trajectory.
+    """
+    import uni_agent.gateway.session.codec as codec_mod
+    from uni_agent.gateway.config import GatewayActorConfig
+    from uni_agent.gateway.gateway import _GatewayActor
+
+    def fake_agent_tool_dispatch(text, tools, parser_name, tokenizer):
+        del tools, parser_name, tokenizer
+        if "<tool_call>" not in text:
+            return text, []
+        return "", [
+            SimpleNamespace(
+                name="Agent",
+                arguments=json.dumps(
+                    {
+                        "description": "Inspect the relevant code",
+                        "name": "code-inspector",
+                        "prompt": "Find the implementation and report the key behavior.",
+                        "subagent_type": "Explore",
+                    }
+                ),
+            )
+        ]
+
+    monkeypatch.setattr(codec_mod, "_extract_tool_calls_with_sglang_or_vllm", fake_agent_tool_dispatch)
+    tool_call_text = (
+        '<tool_call>\n{"name":"Agent","arguments":{"description":"Inspect the relevant code",'
+        '"name":"code-inspector","prompt":"Find the implementation and report the key behavior.",'
+        '"subagent_type":"Explore"}}\n</tool_call>'
+    )
+    actor = _GatewayActor(
+        GatewayActorConfig(tokenizer=FakeTokenizer(), tool_parser_name="hermes"),
+        QueuedBackend([tool_call_text, "SUBAGENT_FINDING", "FINAL_FROM_MAIN"]),
+    )
+    actor._server_base_url = "http://gateway.local"
+    session_id = "claude-code-native-subagent"
+    await actor.create_session(session_id)
+
+    agent_tool = {
+        "name": "Agent",
+        "description": "Launch a focused subagent",
+        "input_schema": {
+            "type": "object",
+            "properties": {
+                "description": {"type": "string"},
+                "name": {"type": "string"},
+                "prompt": {"type": "string"},
+                "subagent_type": {"type": "string"},
+            },
+            "required": ["description", "prompt"],
+        },
+    }
+    first = await actor._handle_anthropic_messages(
+        session_id,
+        {
+            "model": "gateway-model",
+            "max_tokens": 128,
+            "system": "x-anthropic-billing-header: cch=main-a\nYou are Claude Code.",
+            "tools": [agent_tool],
+            "messages": [{"role": "user", "content": "Fix the issue and use a subagent first."}],
+        },
+    )
+    first_body = json.loads(first.body)
+    tool_use = first_body["content"][0]
+    assert tool_use["type"] == "tool_use"
+    assert tool_use["name"] == "Agent"
+
+    subagent = await actor._handle_anthropic_messages(
+        session_id,
+        {
+            "model": "gateway-model",
+            "max_tokens": 128,
+            "system": "x-anthropic-billing-header: cch=subagent\nYou are a focused code-inspection subagent.",
+            "tools": [
+                {
+                    "name": "Read",
+                    "description": "Read a file",
+                    "input_schema": {"type": "object", "properties": {"file_path": {"type": "string"}}},
+                }
+            ],
+            "messages": [{"role": "user", "content": "Inspect the relevant implementation."}],
+        },
+    )
+    assert json.loads(subagent.body)["content"] == [{"type": "text", "text": "SUBAGENT_FINDING"}]
+
+    final = await actor._handle_anthropic_messages(
+        session_id,
+        {
+            "model": "gateway-model",
+            "max_tokens": 128,
+            "system": "x-anthropic-billing-header: cch=main-b\nYou are Claude Code.",
+            "tools": [agent_tool],
+            "messages": [
+                {"role": "user", "content": "Fix the issue and use a subagent first."},
+                {"role": "assistant", "content": first_body["content"]},
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "tool_result",
+                            "tool_use_id": tool_use["id"],
+                            "content": [{"type": "text", "text": "SUBAGENT_FINDING"}],
+                        }
+                    ],
+                },
+            ],
+        },
+    )
+    assert json.loads(final.body)["content"] == [{"type": "text", "text": "FINAL_FROM_MAIN"}]
+
+    await actor.set_reward_info(session_id, {"reward_score": 1.0, "claude_code_exit_code": 0})
+    trajectories = await actor.finalize_session(session_id)
+    decoded = [FakeTokenizer().decode(trajectory.response_ids) for trajectory in trajectories]
+
+    assert len(trajectories) == 2
+    assert decoded[0] == "SUBAGENT_FINDING"
+    assert decoded[1].startswith(tool_call_text)
+    assert decoded[1].endswith("FINAL_FROM_MAIN")
+    assert 0 in trajectories[1].response_mask
+    assert 1 in trajectories[1].response_mask
+    assert all(len(trajectory.response_ids) == len(trajectory.response_mask) for trajectory in trajectories)
+    assert all(len(trajectory.response_ids) == len(trajectory.response_logprobs) for trajectory in trajectories)
+    assert trajectories[0].reward_info == trajectories[1].reward_info
+
+
+@pytest.mark.asyncio
 async def test_anthropic_error_envelope_shape():
     """Malformed Anthropic requests return Anthropic-shaped error bodies rather
     than OpenAI or FastAPI default error envelopes."""

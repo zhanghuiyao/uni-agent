@@ -107,7 +107,108 @@ The training YAML keeps `claude_code` as the only runner:
 agent_runner_fqn: examples.blackbox_recipes.claude_code.claude_code_runner.claude_code_runner
 ```
 
-## 3. Configuration
+## 3. Inference-only Multiple Chains + Subagents Validation
+
+This path runs rollout and reward without starting the trainer. It exercises the
+complete Claude Code flow: the main agent invokes an `Agent`/`Task` tool, Claude
+Code sends the subagent request through the same Gateway session, and the final
+tool result returns to the original main chain.
+
+Two switches control the behavior:
+
+- `ENABLE_SUBAGENTS=1` sets `CLAUDE_CODE_FORK_SUBAGENT=1` and allows the
+  `Agent`/`Task` tools. Claude may still decide that a subagent is unnecessary.
+- `REQUIRE_SUBAGENT=1` is an acceptance-test mode. It additionally instructs
+  Claude to spawn at least one subagent and exits nonzero if no successful
+  multiple-chain session is captured. It requires `ENABLE_SUBAGENTS=1`.
+
+`N` is the number of independent rollout sessions per sample; it is not the
+number of chains. A single session with one spawned subagent normally produces
+at least two trajectory records: the subagent chain followed by the resumed
+main chain.
+
+### 3.1 Build and Push the Tool Image
+
+Skip this step when `CLAUDE_CODE_TOOL_IMAGE` already points to an image that the
+AKernel sandbox can access.
+
+```bash
+TOOL_VERSION=latest TOOL_TAG=latest \
+bash examples/blackbox_recipes/claude_code/build_tool.sh \
+  --registry <registry>
+```
+
+To make a run reproducible, replace `latest` with an explicit Claude Code
+version in both variables and use the matching image tag below.
+
+### 3.2 Run One Forced-subagent Sample
+
+Use a healthy Python environment that can import `httpx`, `ray`, and `torch`.
+The data file must use the SWE-bench parquet schema expected by this recipe.
+
+```bash
+AKERNEL_SERVER_ADDRESS=<server> \
+AKERNEL_TOKEN=<token> \
+CLAUDE_CODE_TOOL_IMAGE=<registry>/claude-code-tool:latest \
+MODEL_PATH=<model> \
+DATA_PATH=<swe_parquet> \
+MAX_SAMPLES=1 \
+N=1 \
+ENABLE_SUBAGENTS=1 \
+REQUIRE_SUBAGENT=1 \
+OUTPUT_DIR=/tmp/uni-agent-claude-subagent \
+bash examples/blackbox_recipes/claude_code/run_infer.sh
+```
+
+For ordinary inference where Claude decides naturally whether to delegate, use
+`ENABLE_SUBAGENTS=1 REQUIRE_SUBAGENT=0`. Leave both at `0` to preserve the
+original single-agent behavior.
+
+### 3.3 Inspect the Saved Trajectories
+
+The output directory contains:
+
+- `trajectories.jsonl`: one record per finalized chain, including token IDs,
+  response mask, rollout log probabilities, reward, turn count, and final-chain
+  marker.
+- `summary.json`: run configuration, resolve statistics, per-session trajectory
+  counts, and structural validation results.
+
+Check the high-level acceptance result:
+
+```bash
+jq '{multiple_chains_sessions, validation, per_session}' \
+  /tmp/uni-agent-claude-subagent/summary.json
+```
+
+Inspect every session directly from the JSONL:
+
+```bash
+jq -s '
+  group_by([.uid, .session_index])
+  | map({
+      uid: .[0].uid,
+      session_index: .[0].session_index,
+      trajectory_count: length,
+      trajectory_indexes: map(.trajectory_index),
+      final_count: ([.[] | select(.is_final_trajectory)] | length),
+      reward_scores: (map(.reward_score) | unique),
+      lengths_aligned: all(.[];
+        ((.response_ids | length) == (.response_mask | length)) and
+        ((.response_ids | length) == (.response_logprobs | length)))
+    })
+' /tmp/uni-agent-claude-subagent/trajectories.jsonl
+```
+
+The run passes when `multiple_chains_sessions >= 1` and
+`validation.passed == true`. The validator also requires contiguous trajectory
+indexes, exactly one final trajectory per session, aligned response fields,
+identical broadcast rewards, and both context (`0`) and generated-output (`1`)
+mask values in the resumed final main chain. SWE task resolution is reported but
+is not required for this feature-level validation. Even when validation fails,
+the JSONL and summary are written before the process exits nonzero.
+
+## 4. Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -116,6 +217,9 @@ agent_runner_fqn: examples.blackbox_recipes.claude_code.claude_code_runner.claud
 | `SWE_AGENT_RUN_TIMEOUT` | `7200` | Max wall time for the claude process in the sandbox |
 | `CLAUDE_CODE_TOOL_IMAGE` | `swr.cn-east-3.myhuaweicloud.com/openyuanrong/claude-code-tool:latest` | Sidecar tool image |
 | `CONDA_ENV` | `testbed` | Conda env activated inside the sandbox before running claude |
+| `ENABLE_SUBAGENTS` | `0` | Allow Claude Code `Agent`/`Task` tools and set `CLAUDE_CODE_FORK_SUBAGENT=1` |
+| `REQUIRE_SUBAGENT` | `0` | Force a subagent in the validation prompt and fail if no multiple-chain session is captured |
+| `OUTPUT_DIR` | `outputs/claude_code_infer` | Inference JSONL and summary output directory |
 
 `AGENT_MAX_TURNS` is the only knob that bounds the agent. The trainer's
 `multi_turn.max_assistant_turns` is not enforced on the blackbox rollout path

@@ -35,6 +35,9 @@ MAX_CONCURRENT_SESSIONS="${MAX_CONCURRENT_SESSIONS:-8}"
 AGENT_MAX_TURNS="${AGENT_MAX_TURNS:-100}"
 CLAUDE_CODE_TOOL_IMAGE="${CLAUDE_CODE_TOOL_IMAGE:-swr.cn-east-3.myhuaweicloud.com/openyuanrong/claude-code-tool:latest}"
 SWE_AGENT_RUN_TIMEOUT="${SWE_AGENT_RUN_TIMEOUT:-7200}"
+ENABLE_SUBAGENTS="${ENABLE_SUBAGENTS:-0}"
+REQUIRE_SUBAGENT="${REQUIRE_SUBAGENT:-0}"
+OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/outputs/claude_code_infer}"
 
 # ── AKernel (remote sandbox) ─────────────────────────────────────────────
 export AKERNEL_SERVER_ADDRESS="${AKERNEL_SERVER_ADDRESS:-}"
@@ -55,7 +58,19 @@ echo "Max samples: ${MAX_SAMPLES}"
 echo "Engine:      ${ENGINE} (TP=${TP})"
 echo "Tool image:  ${CLAUDE_CODE_TOOL_IMAGE}"
 echo "Batch:       n=${N}, gateway=${GATEWAY_COUNT}, max_sessions=${MAX_CONCURRENT_SESSIONS}"
+echo "Subagents:   enabled=${ENABLE_SUBAGENTS}, required=${REQUIRE_SUBAGENT}"
+echo "Artifacts:   ${OUTPUT_DIR}"
 echo "====================================="
+
+EXTRA_ARGS=()
+if [[ "${ENABLE_SUBAGENTS}" == "1" ]]; then
+    EXTRA_ARGS+=(--enable-subagents)
+fi
+if [[ "${REQUIRE_SUBAGENT}" == "1" ]]; then
+    EXTRA_ARGS+=(--require-subagent)
+fi
+
+python -c "import httpx, ray, torch" >/dev/null
 
 python examples/blackbox_recipes/claude_code/parallel_infer.py \
     --model-path "${MODEL_PATH}" \
@@ -74,4 +89,6 @@ python examples/blackbox_recipes/claude_code/parallel_infer.py \
     --max-concurrent-sessions "${MAX_CONCURRENT_SESSIONS}" \
     --tool-image "${CLAUDE_CODE_TOOL_IMAGE}" \
     --run-timeout "${SWE_AGENT_RUN_TIMEOUT}" \
-    --max-turns "${AGENT_MAX_TURNS}"
+    --max-turns "${AGENT_MAX_TURNS}" \
+    --output-dir "${OUTPUT_DIR}" \
+    "${EXTRA_ARGS[@]}"

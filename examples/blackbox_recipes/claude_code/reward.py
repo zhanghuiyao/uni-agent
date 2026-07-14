@@ -17,6 +17,8 @@ from typing import Any
 
 logger = logging.getLogger(__name__)
 
+_SAFE_REWARD_INFO_KEYS = ("claude_code_exit_code", "resolved", "eval_completed")
+
 
 def build_reward_context(tools_kwargs: dict) -> tuple[dict[str, Any], int]:
     """Extract reward metadata and eval_timeout from per-sample tools_kwargs."""
@@ -30,11 +32,21 @@ def build_reward_context(tools_kwargs: dict) -> tuple[dict[str, Any], int]:
 
 
 def compute_score(data_source: str, solution_str: str, ground_truth: str, extra_info=None) -> dict:
-    """Read reward_score from extra_info, injected by the agent runner."""
+    """Read reward data injected by the agent runner.
+
+    Only the fields needed by inference validation are returned as reward
+    metadata. This keeps arbitrary evaluator or credential-bearing fields out
+    of saved trajectory artifacts.
+    """
     score = 0.0
     if extra_info and "reward_score" in extra_info:
         score = float(extra_info["reward_score"])
-    return {"score": score}
+    result = {"score": score}
+    if extra_info:
+        for key in _SAFE_REWARD_INFO_KEYS:
+            if key in extra_info:
+                result[key] = extra_info[key]
+    return result
 
 
 def _get_reward_spec(data_source: str):
