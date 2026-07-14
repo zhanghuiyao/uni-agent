@@ -17,7 +17,7 @@ from tests.uni_agent.support import (
     InspectingBackend,
     InspectingSequencedBackend,
     QueuedBackend,
-    RejectConcurrentSessionBackend,
+    RecordingConcurrentBackend,
     RejectRequestEnvelopeBackend,
     SequencedBackend,
     SingleUseVisionInfoExtractor,
@@ -39,6 +39,14 @@ def ray_runtime():
     ray.init(ignore_reinit_error=True, include_dashboard=False)
     yield
     ray.shutdown()
+
+
+@pytest.mark.parametrize("response_length", [0, -1])
+def test_gateway_actor_config_rejects_non_positive_response_length(response_length):
+    from uni_agent.gateway.config import GatewayActorConfig
+
+    with pytest.raises(ValueError, match="response_length must be positive"):
+        GatewayActorConfig(tokenizer=FakeTokenizer(), response_length=response_length)
 
 
 @pytest.mark.asyncio
@@ -63,6 +71,7 @@ async def test_gateway_actor_max_tokens_clamped_to_remaining_response_budget():
         await actor.create_session("s1")
         first_messages = [{"role": "user", "content": "hi"}]
         await actor._handle_openai_chat_completions("s1", {"messages": first_messages})
+        assert backend.calls[-1]["sampling_params"]["max_tokens"] == 100
 
         await actor._handle_openai_chat_completions(
             "s1",
@@ -79,7 +88,7 @@ async def test_gateway_actor_max_tokens_clamped_to_remaining_response_budget():
 
 
 @pytest.mark.asyncio
-async def test_gateway_actor_over_budget_clamps_remaining_response_budget_to_zero():
+async def test_gateway_actor_over_budget_closes_without_backend_call():
     from uni_agent.gateway.config import GatewayActorConfig
     from uni_agent.gateway.gateway import _GatewayActor
 
@@ -98,7 +107,7 @@ async def test_gateway_actor_over_budget_clamps_remaining_response_budget_to_zer
         first_messages = [{"role": "user", "content": "hi"}]
         await actor._handle_openai_chat_completions("s1", {"messages": first_messages})
 
-        await actor._handle_openai_chat_completions(
+        response = await actor._handle_openai_chat_completions(
             "s1",
             {
                 "messages": [*first_messages, {"role": "assistant", "content": "A" * 60}],
@@ -106,7 +115,10 @@ async def test_gateway_actor_over_budget_clamps_remaining_response_budget_to_zer
             },
         )
 
-        assert backend.calls[-1]["sampling_params"]["max_tokens"] == 0
+        body = json.loads(response.body)
+        assert body["choices"][0]["finish_reason"] == "length"
+        assert len(backend.calls) == 1
+        assert backend.steps == ["B"]
     finally:
         await actor.shutdown()
 
@@ -281,13 +293,15 @@ async def test_request_chat_template_kwargs_forwarded(monkeypatch):
     from uni_agent.gateway.config import GatewayActorConfig
     from uni_agent.gateway.gateway import _GatewayActor
 
+    template_kwargs = {"enable_thinking": False, "default_only": "kept"}
     actor = _GatewayActor(
         GatewayActorConfig(
             tokenizer=FakeTokenizer(),
-            apply_chat_template_kwargs={"enable_thinking": False, "default_only": "kept"},
+            apply_chat_template_kwargs=template_kwargs,
         ),
         InspectingBackend(),
     )
+    template_kwargs["enable_thinking"] = True
     captured_kwargs = {}
     template_fn_name = "_apply_chat" + "_template"
     original_template = getattr(codec_mod, template_fn_name)
@@ -313,154 +327,6 @@ async def test_request_chat_template_kwargs_forwarded(monkeypatch):
         assert captured_kwargs["extra_flag"] == "x"
     finally:
         await actor.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_gateway_actor_create_session_forwards_session_budget(monkeypatch):
-    from uni_agent.gateway import gateway as gateway_mod
-    from uni_agent.gateway.config import GatewayActorConfig
-
-    captured = {}
-
-    class _RecordingGatewaySession:
-        def __init__(
-            self,
-            *,
-            handle,
-            codec,
-            prompt_length=None,
-            response_length=None,
-            enable_parallel_session_generation=False,
-        ):
-            captured["handle"] = handle
-            captured["codec"] = codec
-            captured["prompt_length"] = prompt_length
-            captured["response_length"] = response_length
-            captured["enable_parallel_session_generation"] = enable_parallel_session_generation
-
-    monkeypatch.setattr(gateway_mod, "GatewaySession", _RecordingGatewaySession)
-    actor = gateway_mod._GatewayActor(
-        GatewayActorConfig(
-            tokenizer=FakeTokenizer(),
-            prompt_length=128,
-            response_length=64,
-            enable_parallel_session_generation=True,
-        ),
-        InspectingBackend(),
-    )
-    actor._server_base_url = "http://gateway.local"
-
-    await actor.create_session("s1")
-
-    assert captured["handle"].session_id == "s1"
-    assert captured["prompt_length"] == 128
-    assert captured["response_length"] == 64
-    assert captured["enable_parallel_session_generation"] is True
-
-
-@pytest.mark.asyncio
-async def test_gateway_actor_default_chains_subagent_return_to_main_finalizes_main_last():
-    from uni_agent.gateway.config import GatewayActorConfig
-    from uni_agent.gateway.gateway import _GatewayActor
-
-    actor = _GatewayActor(
-        GatewayActorConfig(tokenizer=FakeTokenizer()),
-        SequencedBackend(["Mango", "Blue", "Apple"]),
-    )
-    actor._server_base_url = "http://gateway.local"
-    session_id = "session-actor-subagent-return"
-
-    await actor.create_session(session_id)
-    main_first = [
-        {"role": "system", "content": "You are helpful."},
-        {"role": "user", "content": "name a fruit"},
-    ]
-    subagent = [
-        {"role": "system", "content": "You are a focused subagent."},
-        {"role": "user", "content": "name a color"},
-    ]
-    main_continuation = [
-        {"role": "system", "content": "You are helpful."},
-        {"role": "user", "content": "name a fruit"},
-        {"role": "assistant", "content": "Mango"},
-        {"role": "user", "content": "name another fruit"},
-    ]
-
-    first = await actor._handle_openai_chat_completions(session_id, {"model": "dummy-model", "messages": main_first})
-    second = await actor._handle_openai_chat_completions(session_id, {"model": "dummy-model", "messages": subagent})
-    third = await actor._handle_openai_chat_completions(
-        session_id,
-        {"model": "dummy-model", "messages": main_continuation},
-    )
-
-    # Insertion order is main (id=1) then subagent (id=2); the continuation re-commits
-    # main in place, so it stays chain id=1. The finalized return order below is the
-    # reverse ([subagent, main]), proving finalize orders by order_seq, not insertion order.
-    state_before = await actor.get_session_state(session_id)
-    assert state_before["num_active_chains"] == 2
-    assert state_before["active_chain_ids"] == [1, 2]
-
-    trajectories = await actor.finalize_session(session_id)
-
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert third.status_code == 200
-    assert len(trajectories) == 2
-    decoded = [FakeTokenizer().decode(trajectory.response_ids) for trajectory in trajectories]
-    assert decoded[0] == "Blue"
-    assert decoded[1].startswith("Mango")
-    assert decoded[1].endswith("Apple")
-    assert "Blue" not in decoded[1]
-    assert 0 in trajectories[1].response_mask
-
-
-@pytest.mark.asyncio
-async def test_gateway_actor_default_chains_repeated_same_prompt_continues_latest_sibling():
-    from uni_agent.gateway.config import GatewayActorConfig
-    from uni_agent.gateway.gateway import _GatewayActor
-
-    actor = _GatewayActor(
-        GatewayActorConfig(tokenizer=FakeTokenizer()),
-        SequencedBackend(["SAME", "SAME", "SAME", "NEXT"]),
-    )
-    actor._server_base_url = "http://gateway.local"
-    session_id = "session-actor-sibling-tie-break"
-    prompt = [{"role": "user", "content": "try the same prompt"}]
-
-    await actor.create_session(session_id)
-    await actor._handle_openai_chat_completions(session_id, {"model": "dummy-model", "messages": prompt})
-    await actor._handle_openai_chat_completions(session_id, {"model": "dummy-model", "messages": prompt})
-    await actor._handle_openai_chat_completions(session_id, {"model": "dummy-model", "messages": prompt})
-    state_before = await actor.get_session_state(session_id)
-    latest_chain_id = state_before["active_chain_ids"][-1]
-    tip_hashes_before = dict(state_before["active_chain_tip_hashes"])
-
-    response = await actor._handle_openai_chat_completions(
-        session_id,
-        {
-            "model": "dummy-model",
-            "messages": [
-                {"role": "user", "content": "try the same prompt"},
-                {"role": "assistant", "content": "SAME"},
-                {"role": "user", "content": "continue the latest sibling"},
-            ],
-        },
-    )
-    state_after = await actor.get_session_state(session_id)
-    trajectories = await actor.finalize_session(session_id)
-
-    assert response.status_code == 200
-    assert state_before["active_chain_ids"] == [1, 2, 3]
-    assert state_after["active_chain_ids"] == [1, 2, 3]
-    assert state_after["active_chain_tip_hashes"][latest_chain_id] != tip_hashes_before[latest_chain_id]
-    assert state_after["active_chain_tip_hashes"][1] == tip_hashes_before[1]
-    assert state_after["active_chain_tip_hashes"][2] == tip_hashes_before[2]
-    assert len(trajectories) == 3
-    decoded = [FakeTokenizer().decode(trajectory.response_ids) for trajectory in trajectories]
-    assert decoded.count("SAME") == 2
-    assert decoded[-1].startswith("SAME")
-    assert decoded[-1].endswith("NEXT")
-    assert 0 in trajectories[-1].response_mask
 
 
 @pytest.mark.asyncio
@@ -1122,6 +988,70 @@ async def test_gateway_actor_allowlist_filters_sampling_params(ray_runtime, back
 
 
 @pytest.mark.asyncio
+async def test_gateway_actor_session_sampling_defaults_are_isolated_and_request_overridable():
+    from uni_agent.gateway.config import GatewayActorConfig
+    from uni_agent.gateway.gateway import _GatewayActor
+
+    backend = SequencedBackend(["TRAIN", "VAL"])
+    actor = _GatewayActor(
+        GatewayActorConfig(
+            tokenizer=FakeTokenizer(),
+            base_sampling_params={
+                "temperature": 0.1,
+                "top_p": 0.2,
+                "top_k": 1,
+                "presence_penalty": 0.3,
+            },
+            response_length=64,
+        ),
+        backend,
+    )
+    await actor.start()
+    train_sampling_params = {"temperature": 0.4, "top_p": 0.5, "logprobs": True}
+    try:
+        await actor.create_session("train-session", sampling_params=train_sampling_params)
+        train_sampling_params["temperature"] = 9.0
+        await actor.create_session(
+            "val-session",
+            sampling_params={"temperature": 0, "top_p": 0.9, "top_k": -1, "logprobs": False},
+        )
+
+        await actor._handle_openai_chat_completions(
+            "train-session",
+            {
+                "messages": [{"role": "user", "content": "train"}],
+                "temperature": 0.7,
+                "max_tokens": 128,
+            },
+        )
+        await actor._handle_openai_chat_completions(
+            "val-session",
+            {"messages": [{"role": "user", "content": "validate"}]},
+        )
+    finally:
+        await actor.shutdown()
+
+    assert [call["sampling_params"] for call in backend.calls] == [
+        {
+            "temperature": 0.7,
+            "top_p": 0.5,
+            "top_k": 1,
+            "presence_penalty": 0.3,
+            "logprobs": True,
+            "max_tokens": 64,
+        },
+        {
+            "temperature": 0,
+            "top_p": 0.9,
+            "top_k": -1,
+            "presence_penalty": 0.3,
+            "logprobs": False,
+            "max_tokens": 64,
+        },
+    ]
+
+
+@pytest.mark.asyncio
 async def test_gateway_actor_continuation_preserves_prompt_and_generation_masks(ray_runtime):
     """Token-truth: on a continuation turn, the incremental interstitial tokens
     (tool results, chat-template glue) get ``response_mask=0``, while the
@@ -1170,58 +1100,12 @@ async def test_gateway_actor_continuation_preserves_prompt_and_generation_masks(
 
 
 @pytest.mark.asyncio
-async def test_gateway_actor_serializes_same_session_concurrent_requests(ray_runtime):
-    """Two concurrent requests to the same session are serialized by
-    ``generation_lock``, each producing its own trajectory with correct
-    response tokens and masks."""
-    from uni_agent.gateway.config import GatewayActorConfig
-    from uni_agent.gateway.gateway import GatewayActor
-
-    actor = GatewayActor.remote(
-        GatewayActorConfig(tokenizer=FakeTokenizer()),
-        RejectConcurrentSessionBackend(["FIRST", "SECOND"]),
-    )
-    ray.get(actor.start.remote())
-    session = ray.get(actor.create_session.remote("session-concurrent"))
-
-    async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
-
-        async def send_request():
-            return await client.post(
-                f"{session.base_url}/chat/completions",
-                json={
-                    "model": "dummy-model",
-                    "messages": [{"role": "user", "content": "same session prompt"}],
-                },
-            )
-
-        first, second = await asyncio.gather(send_request(), send_request())
-
-    trajectories = ray.get(actor.finalize_session.remote("session-concurrent"))
-    ray.get(actor.shutdown.remote())
-
-    assert first.status_code == 200
-    assert second.status_code == 200
-    assert len(trajectories) == 2
-    assert trajectories[0].response_ids == [ord(char) for char in "FIRST"]
-    assert trajectories[1].response_ids == [ord(char) for char in "SECOND"]
-    assert trajectories[0].response_mask == [1] * len("FIRST")
-    assert trajectories[1].response_mask == [1] * len("SECOND")
-
-
-@pytest.mark.asyncio
-async def test_gateway_actor_parallel_same_session_requests_when_flag_enabled():
+async def test_gateway_actor_parallel_same_session_requests_by_default():
     from uni_agent.gateway.config import GatewayActorConfig
     from uni_agent.gateway.gateway import _GatewayActor
 
-    backend = RejectConcurrentSessionBackend(["FIRST", "SECOND"], delay=0.05)
-    actor = _GatewayActor(
-        GatewayActorConfig(
-            tokenizer=FakeTokenizer(),
-            enable_parallel_session_generation=True,
-        ),
-        backend,
-    )
+    backend = RecordingConcurrentBackend(["FIRST", "SECOND"], delay=0.05)
+    actor = _GatewayActor(GatewayActorConfig(tokenizer=FakeTokenizer()), backend)
     actor._server_base_url = "http://gateway.local"
     await actor.create_session("session-parallel")
 
@@ -1237,8 +1121,7 @@ async def test_gateway_actor_parallel_same_session_requests_when_flag_enabled():
     assert json.loads(first.body)["choices"][0]["finish_reason"] == "stop"
     assert json.loads(second.body)["choices"][0]["finish_reason"] == "stop"
     request_ids = [window[0] for window in backend.call_windows]
-    assert len(request_ids) == len(set(request_ids)) == 2
-    assert all(request_id.startswith("session-parallel:") for request_id in request_ids)
+    assert request_ids == ["session-parallel"] * 2
     assert max(start for _, start, _ in backend.call_windows) < min(finish for _, _, finish in backend.call_windows)
     assert sorted(FakeTokenizer().decode(trajectory.response_ids) for trajectory in trajectories) == [
         "FIRST",
@@ -1328,57 +1211,6 @@ async def test_gateway_actor_backend_failure_does_not_commit_partial_state(ray_r
     assert response.json()["error"]["type"] == "internal_server_error"
     assert state["num_trajectories"] == 0
     assert state["has_active_trajectory"] is False
-
-
-@pytest.mark.asyncio
-async def test_gateway_actor_backend_failure_after_tool_mismatch_does_not_split(ray_runtime):
-    """When the first turn succeeds but the second turn causes a backend
-    failure, the first turn's trajectory is still preserved at finalization
-    (materialized correctly), and the pre-failure session state shows zero
-    trajectories (because the active one was not yet committed)."""
-    from uni_agent.gateway.config import GatewayActorConfig
-    from uni_agent.gateway.gateway import GatewayActor
-
-    actor = GatewayActor.remote(
-        GatewayActorConfig(tokenizer=FakeTokenizer()),
-        SequencedBackend(["FIRST", RuntimeError("boom")]),
-    )
-    ray.get(actor.start.remote())
-    session = ray.get(actor.create_session.remote("session-failure-mismatch"))
-
-    async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
-        first = await client.post(
-            f"{session.base_url}/chat/completions",
-            json={
-                "model": "dummy-model",
-                "tools": [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}],
-                "messages": [{"role": "user", "content": "first turn"}],
-            },
-        )
-        assert first.status_code == 200
-
-    async with httpx.AsyncClient(timeout=5.0, trust_env=False) as client:
-        second = await client.post(
-            f"{session.base_url}/chat/completions",
-            json={
-                "model": "dummy-model",
-                "tools": [{"type": "function", "function": {"name": "lookup", "parameters": {"type": "object"}}}],
-                "messages": [
-                    {"role": "user", "content": "first turn"},
-                    {"role": "assistant", "content": "FIRST"},
-                    {"role": "user", "content": "follow up"},
-                ],
-            },
-        )
-        assert second.status_code == 500
-
-    state = ray.get(actor.get_session_state.remote("session-failure-mismatch"))
-    trajectories = ray.get(actor.finalize_session.remote("session-failure-mismatch"))
-    ray.get(actor.shutdown.remote())
-
-    assert state["num_trajectories"] == 0
-    assert len(trajectories) == 1
-    assert trajectories[0].response_ids == [ord(char) for char in "FIRST"]
 
 
 @pytest.mark.asyncio

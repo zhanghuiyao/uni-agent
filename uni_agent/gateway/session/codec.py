@@ -140,7 +140,7 @@ class MessageCodec:
         self._processor = processor
         self._vision_info_extractor = vision_info_extractor or self._default_vision_info_extractor
         self._vision_info_extractor_kwargs = dict(vision_info_extractor_kwargs or {})
-        self._apply_chat_template_kwargs = apply_chat_template_kwargs or {}
+        self._apply_chat_template_kwargs = dict(apply_chat_template_kwargs or {})
         # Derive the cached default-kwargs system prompt from the processor when one is
         # present: encode_incremental() slices processor-produced ids by this length on the
         # default path, and a tokenizer-derived prefix would mis-slice the continuation delta

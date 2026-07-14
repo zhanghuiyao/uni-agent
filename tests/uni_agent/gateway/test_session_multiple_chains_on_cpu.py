@@ -35,7 +35,6 @@ def _session(
     processor=None,
     vision_info_extractor=None,
     tool_parser_name: str | None = None,
-    enable_parallel_session_generation: bool = False,
 ) -> GatewaySession:
     return GatewaySession(
         SessionHandle(session_id=session_id),
@@ -47,8 +46,13 @@ def _session(
             apply_chat_template_kwargs=apply_chat_template_kwargs,
         ),
         response_length=response_length,
-        enable_parallel_session_generation=enable_parallel_session_generation,
     )
+
+
+@pytest.mark.parametrize("response_length", [0, -1])
+def test_gateway_session_rejects_non_positive_response_length(response_length):
+    with pytest.raises(ValueError, match="response_length must be positive"):
+        _session("invalid-response-length", response_length=response_length)
 
 
 async def _run(session: GatewaySession, backend: SequencedBackend, messages: list[dict], **payload_extra):
@@ -64,18 +68,6 @@ async def _run(session: GatewaySession, backend: SequencedBackend, messages: lis
         },
         backend,
     )
-
-
-@pytest.mark.parametrize(
-    ("flag_name", "bad_value"),
-    [
-        ("enable_parallel_session_generation", "true"),
-        ("enable_parallel_session_generation", 1),
-    ],
-)
-def test_gateway_session_rejects_non_bool_m2_flags(flag_name, bad_value):
-    with pytest.raises(ValueError, match=f"{flag_name} must be a bool"):
-        _session("bad-m2-flag", **{flag_name: bad_value})
 
 
 def test_encode_incremental_uses_request_chat_template_kwargs_for_prefix_slice(monkeypatch):
@@ -191,13 +183,12 @@ def test_encode_incremental_processor_default_kwargs_uses_processor_prefix_for_s
 
     class _Encoder:
         @staticmethod
-        def _prefix(prefix_style: str = "short") -> str:
+        def _prefix(prefix_style="short"):
             return "<s>" if prefix_style == "short" else "<long-system-prefix>"
 
         def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True, tools=None, **kwargs):
             text = self._prefix(**kwargs)
-            for message in messages:
-                text += f"{message['role']}:{message.get('content', '')}\n"
+            text += "".join(f"{message['role']}:{message.get('content', '')}\n" for message in messages)
             if add_generation_prompt:
                 text += "assistant:"
             return _ids(text) if tokenize else text
@@ -205,44 +196,41 @@ def test_encode_incremental_processor_default_kwargs_uses_processor_prefix_for_s
         def decode(self, token_ids, skip_special_tokens=True):
             return "".join(chr(token_id) for token_id in token_ids)
 
-    # The processor prepends a BOS token the bare tokenizer never emits, so its system-prompt
-    # prefix is one token longer even under default kwargs. On the default-kwargs path
-    # (request kwargs omitted or effective-equal to codec defaults) encode_incremental() must
-    # still strip with the processor-derived prefix, not the cached tokenizer-derived
-    # _system_prompt, or the continuation delta is off by the BOS token.
     processor_bos = 9999
 
     class _Processor(_Encoder):
-        def system_prompt(self, **kwargs) -> list[int]:
+        def system_prompt(self, **kwargs):
             return [processor_bos] + _ids(self._prefix(**kwargs))
 
         def __call__(
             self, *, text, images=None, videos=None, video_metadata=None, return_tensors=None, do_sample_frames=False
         ):
-            assert len(text) == 1
             return {"input_ids": torch.tensor([[processor_bos] + _ids(text[0])], dtype=torch.long)}
 
-    class _PlainTokenizer(_Encoder):
-        def system_prompt(self, **kwargs) -> list[int]:
+    class _Tokenizer(_Encoder):
+        def system_prompt(self, **kwargs):
             return _ids(self._prefix(**kwargs))
 
-    def apply_chat_template(encoder, messages, **kwargs):
-        return encoder.apply_chat_template(messages, **kwargs)
-
-    def initialize_system_prompt(encoder, **kwargs):
-        return encoder.system_prompt(**kwargs)
-
-    monkeypatch.setattr(codec_mod, "_apply_chat_template", apply_chat_template)
-    monkeypatch.setattr(codec_mod, "initialize_system_prompt", initialize_system_prompt)
-
-    codec = MessageCodec(
-        _PlainTokenizer(),
-        processor=_Processor(),
-        apply_chat_template_kwargs={"prefix_style": "short"},
+    monkeypatch.setattr(
+        codec_mod,
+        "_apply_chat_template",
+        lambda encoder, messages, **kwargs: encoder.apply_chat_template(messages, **kwargs),
+    )
+    monkeypatch.setattr(
+        codec_mod,
+        "initialize_system_prompt",
+        lambda encoder, **kwargs: encoder.system_prompt(**kwargs),
     )
 
-    omitted = codec.encode_incremental([{"role": "user", "content": "delta"}])
-    assert _PlainTokenizer().decode(omitted) == "user:delta\nassistant:"
+    codec = MessageCodec(
+        _Tokenizer(),
+        processor=_Processor(),
+        apply_chat_template_kwargs={"prefix_style": "long"},
+    )
+
+    incremental_ids = codec.encode_incremental([{"role": "user", "content": "delta"}])
+
+    assert _Tokenizer().decode(incremental_ids) == "user:delta\nassistant:"
 
 
 class _LogprobBackend:
@@ -257,29 +245,6 @@ class _LogprobBackend:
         elif log_probs == "short":
             log_probs = [-0.1]
         return TokenOutput(token_ids=token_ids, log_probs=log_probs, stop_reason="completed")
-
-
-class _DelayedBackend:
-    def __init__(self, text: str):
-        self.text = text
-        self.calls = []
-        self.entered = asyncio.Event()
-        self.release = asyncio.Event()
-
-    async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
-        self.calls.append(
-            {
-                "request_id": request_id,
-                "prompt_ids": list(prompt_ids),
-                "sampling_params": dict(sampling_params),
-                "image_data": image_data,
-                "video_data": video_data,
-            }
-        )
-        self.entered.set()
-        await self.release.wait()
-        token_ids = _ids(self.text)
-        return TokenOutput(token_ids=token_ids, log_probs=[-0.1] * len(token_ids), stop_reason="completed")
 
 
 class _ControlledParallelBackend:
@@ -351,16 +316,9 @@ def _assert_active_chain_hashes_match_history(session: GatewaySession) -> None:
         assert state["active_chain_tip_hashes"][chain.chain_id] == chain.message_prefix_hashes[-1]
 
 
-async def _wait_for_no_inflight(session: GatewaySession) -> None:
-    for _ in range(20):
-        if session.snapshot_state()["num_inflight_generations"] == 0:
-            return
-        await asyncio.sleep(0)
-    assert session.snapshot_state()["num_inflight_generations"] == 0
-
-
 @pytest.mark.asyncio
 async def test_multiple_chains_linear_conversation_stays_single_chain():
+    """Continue a linear conversation on one active chain and trajectory."""
     session = _session("linear")
     backend = SequencedBackend(["FIRST", "SECOND"])
     first_messages = [{"role": "user", "content": "first turn"}]
@@ -383,6 +341,7 @@ async def test_multiple_chains_linear_conversation_stays_single_chain():
 
 @pytest.mark.asyncio
 async def test_multiple_chains_subagent_system_split_returns_to_main_chain():
+    """Split subagent history into a sibling and later resume the main chain."""
     session = _session("subagent-return")
     backend = SequencedBackend(["Mango", "Blue", "Apple"])
     main_first = [HELPFUL_SYS, {"role": "user", "content": "name a fruit"}]
@@ -398,34 +357,11 @@ async def test_multiple_chains_subagent_system_split_returns_to_main_chain():
     await _run(session, backend, subagent)
     await _run(session, backend, main_continuation)
 
-    # active_chains insertion order is main (id=1, created first) then subagent (id=2),
-    # but main is the *later-updated* chain (it committed last via the continuation).
-    assert [chain.chain_id for chain in session.active_chains] == [1, 2]
-    active_by_id = {chain.chain_id: chain for chain in session.active_chains}
-    main_updated_seq = active_by_id[1].updated_seq
-    subagent_updated_seq = active_by_id[2].updated_seq
-    assert main_updated_seq > subagent_updated_seq
-    order_seq_before = session._order_seq
+    state = session.snapshot_state()
+    assert state["active_chain_ids"] == [1, 2]
+    assert state["active_chain_updated_seq"][1] > state["active_chain_updated_seq"][2]
 
     trajectories = await session.finalize()
-
-    # finalize must not advance _order_seq nor rewrite any chain's updated_seq; active
-    # chains keep order_seq == updated_seq, so the return order is decided by order_seq,
-    # not by active_chains insertion order.
-    assert session._order_seq == order_seq_before
-    materialized_by_id = {chain.chain_id: chain for chain in session.materialized_chains}
-    assert materialized_by_id[1].updated_seq == main_updated_seq
-    assert materialized_by_id[2].updated_seq == subagent_updated_seq
-    assert materialized_by_id[1].order_seq == main_updated_seq
-    assert materialized_by_id[2].order_seq == subagent_updated_seq
-    # materialized_chains keeps active-insertion order [1, 2]; finalize derives the returned
-    # order by sorting on order_seq, yielding [2, 1] (subagent then main) — the reverse of
-    # insertion order. The decoded assertions below confirm the returned trajectories follow it.
-    assert [chain.chain_id for chain in session.materialized_chains] == [1, 2]
-    assert [chain.chain_id for chain in sorted(session.materialized_chains, key=lambda chain: chain.order_seq)] == [
-        2,
-        1,
-    ]
 
     assert len(trajectories) == 2
     decoded = [_decode_response_ids(t.response_ids) for t in trajectories]
@@ -439,6 +375,7 @@ async def test_multiple_chains_subagent_system_split_returns_to_main_chain():
 
 @pytest.mark.asyncio
 async def test_multiple_chains_context_compaction_starts_new_chain():
+    """Start a new chain when compacted context no longer matches a stored prefix."""
     session = _session("compaction")
     backend = SequencedBackend(["DETAILED", "AFTER_SUMMARY"])
 
@@ -461,6 +398,7 @@ async def test_multiple_chains_context_compaction_starts_new_chain():
 
 @pytest.mark.asyncio
 async def test_multiple_chains_repeated_same_prompt_creates_siblings_and_continues_latest():
+    """Create siblings for repeated prompts and continue the most recently updated one."""
     session = _session("siblings")
     backend = SequencedBackend(["SAME", "SAME", "SAME", "NEXT"])
     prompt = [{"role": "user", "content": "try the same prompt"}]
@@ -490,6 +428,7 @@ async def test_multiple_chains_repeated_same_prompt_creates_siblings_and_continu
 
 @pytest.mark.asyncio
 async def test_multiple_chains_distinct_sibling_continuation_matches_older_assistant_prefix():
+    """Select an older sibling when its assistant prefix uniquely matches the request."""
     session = _session("distinct-sibling")
     backend = SequencedBackend(["OLDER", "NEWER", "CONT"])
     prompt = [{"role": "user", "content": "same prompt"}]
@@ -524,59 +463,48 @@ async def test_multiple_chains_distinct_sibling_continuation_matches_older_assis
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_parallel_same_tip_stale_success_becomes_sibling():
-    session = _session("parallel-stale", enable_parallel_session_generation=True)
-    await _run(session, SequencedBackend(["BASE"]), [{"role": "user", "content": "base"}])
+async def test_multiple_chains_reserved_siblings_fall_back_before_starting_new_chain():
+    """Reserve matching siblings newest-first, then full-encode when all are busy."""
+    session = _session("reserved-siblings")
+    prompt = [{"role": "user", "content": "same prompt"}]
+    for _ in range(3):
+        await _run(session, SequencedBackend(["SAME"]), prompt)
+
     continuation = [
-        {"role": "user", "content": "base"},
-        {"role": "assistant", "content": "BASE"},
-        {"role": "user", "content": "branch from same tip"},
+        *prompt,
+        {"role": "assistant", "content": "SAME"},
+        {"role": "user", "content": "continue"},
     ]
-    backend = _ControlledParallelBackend(["SAME", "SAME"])
+    backend = _ControlledParallelBackend(["CHAIN3", "CHAIN2", "CHAIN1", "NEW"])
+    tasks = []
+    for call_count in range(1, 5):
+        tasks.append(asyncio.create_task(_run(session, backend, continuation)))
+        await backend.wait_for_calls(call_count)
 
-    first_task = asyncio.create_task(_run(session, backend, continuation))
-    second_task = asyncio.create_task(_run(session, backend, continuation))
-    await backend.wait_for_calls(2)
-    assert session.snapshot_state()["num_inflight_generations"] == 2
+    assert session.snapshot_state()["active_chain_ids"] == [1, 2, 3]
+    assert [call["request_id"] for call in backend.calls] == ["reserved-siblings"] * 4
 
-    backend.release_call(1)
-    await second_task
-    assert session.snapshot_state()["active_chain_ids"] == [1]
+    for index in (3, 2, 1, 0):
+        backend.release_call(index)
+    await asyncio.gather(*tasks)
 
-    backend.release_call(0)
-    await first_task
-    state_after_race = session.snapshot_state()
-    assert state_after_race["active_chain_ids"] == [1, 2]
-    assert state_after_race["active_chain_updated_seq"][2] > state_after_race["active_chain_updated_seq"][1]
-    assert state_after_race["num_inflight_generations"] == 0
+    chains_by_id = {chain.chain_id: chain for chain in session.active_chains}
+    assert set(chains_by_id) == {1, 2, 3, 4}
+    assert _decode_response_ids(chains_by_id[3].buffer.response_ids).endswith("CHAIN3")
+    assert _decode_response_ids(chains_by_id[2].buffer.response_ids).endswith("CHAIN2")
+    assert _decode_response_ids(chains_by_id[1].buffer.response_ids).endswith("CHAIN1")
+    assert all(0 in chains_by_id[chain_id].buffer.response_mask for chain_id in (1, 2, 3))
 
-    await _run(
-        session,
-        SequencedBackend(["NEXT"]),
-        [
-            *continuation,
-            {"role": "assistant", "content": "SAME"},
-            {"role": "user", "content": "continue latest identical sibling"},
-        ],
-    )
-    state_after_continuation = session.snapshot_state()
-    assert state_after_continuation["active_chain_ids"] == [1, 2]
-    assert (
-        state_after_continuation["active_chain_updated_seq"][2]
-        > state_after_continuation["active_chain_updated_seq"][1]
-    )
-
-    trajectories = await session.finalize()
-    decoded = [_decode_response_ids(trajectory.response_ids) for trajectory in trajectories]
-    assert len(trajectories) == 2
-    assert decoded[0].endswith("SAME")
-    assert decoded[1].endswith("NEXT")
-    assert 0 in trajectories[1].response_mask
+    new_chain = chains_by_id[4]
+    assert new_chain.buffer.prompt_ids == session._codec.encode_full(continuation)
+    assert new_chain.buffer.response_ids == _ids("NEW")
+    assert new_chain.buffer.response_mask == [1] * len("NEW")
 
 
 @pytest.mark.asyncio
 async def test_multiple_chains_parallel_different_chains_commit_in_place():
-    session = _session("parallel-different-chains", enable_parallel_session_generation=True)
+    """Commit parallel generations in place when they target distinct live chains."""
+    session = _session("parallel-different-chains")
     backend = SequencedBackend(["MAIN1", "SUB1"])
     main_first = [HELPFUL_SYS, {"role": "user", "content": "main"}]
     subagent = [SUBAGENT_SYS, {"role": "user", "content": "sub"}]
@@ -611,8 +539,9 @@ async def test_multiple_chains_parallel_different_chains_commit_in_place():
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_parallel_same_prompt_new_chain_siblings_and_unique_request_ids():
-    session = _session("parallel-new-siblings", enable_parallel_session_generation=True)
+async def test_multiple_chains_parallel_new_siblings_reuse_session_request_id():
+    """Retain concurrent first-turn siblings while reusing the sticky session id."""
+    session = _session("parallel-new-siblings")
     backend = _ControlledParallelBackend(["A", "B", "C"])
     prompt = [{"role": "user", "content": "same first turn"}]
 
@@ -623,9 +552,7 @@ async def test_multiple_chains_parallel_same_prompt_new_chain_siblings_and_uniqu
     await asyncio.gather(*tasks)
 
     request_ids = [call["request_id"] for call in backend.calls]
-    assert len(request_ids) == len(set(request_ids)) == 3
-    assert all(request_id.startswith("parallel-new-siblings:") for request_id in request_ids)
-    assert "parallel-new-siblings" not in request_ids
+    assert request_ids == ["parallel-new-siblings"] * 3
     assert session.snapshot_state()["active_chain_ids"] == [1, 2, 3]
     trajectories = await session.finalize()
     assert sorted(_decode_response_ids(trajectory.response_ids) for trajectory in trajectories) == ["A", "B", "C"]
@@ -672,25 +599,8 @@ async def test_multiple_chains_tools_and_effective_chat_template_kwargs_gate_reu
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_finalize_clears_active_chains():
-    session = _session("finalize-clears")
-    backend = SequencedBackend(["ONE", "TWO"])
-
-    await _run(session, backend, [{"role": "user", "content": "first branch"}])
-    await _run(session, backend, [{"role": "user", "content": "second branch"}])
-    trajectories = await session.finalize()
-    state = session.snapshot_state()
-
-    assert len(trajectories) == 2
-    assert state["phase"] == "FINALIZED"
-    assert state["num_active_chains"] == 0
-    assert state["active_chain_ids"] == []
-    assert state["has_active_trajectory"] is False
-    assert state["num_trajectories"] == 2
-
-
-@pytest.mark.asyncio
 async def test_multiple_chains_committed_assistant_tip_hash_round_trips_through_echoed_request():
+    """Match a continuation that echoes the canonical committed assistant message."""
     session = _session("hash-round-trip")
     backend = SequencedBackend(["FIRST", "SECOND"])
 
@@ -724,28 +634,32 @@ async def test_multiple_chains_committed_assistant_tip_hash_round_trips_through_
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_backend_failure_does_not_mutate_selected_chain():
+async def test_multiple_chains_backend_failure_releases_reserved_chain_for_retry():
+    """Release an existing-chain reservation when backend generation fails."""
     session = _session("backend-failure")
-    backend = SequencedBackend(["FIRST", RuntimeError("boom")])
     first_messages = [{"role": "user", "content": "first turn"}]
-    second_messages = [
-        {"role": "user", "content": "first turn"},
+    continuation = [
+        *first_messages,
         {"role": "assistant", "content": "FIRST"},
         {"role": "user", "content": "follow up"},
     ]
 
-    await _run(session, backend, first_messages)
-    with pytest.raises(Exception, match="boom"):
-        await _run(session, backend, second_messages)
+    await _run(session, SequencedBackend(["FIRST"]), first_messages)
+    with pytest.raises(HTTPException, match="RuntimeError: boom"):
+        await _run(session, SequencedBackend([RuntimeError("boom")]), continuation)
+
+    await _run(session, SequencedBackend(["SECOND"]), continuation)
+    assert session.snapshot_state()["active_chain_ids"] == [1]
     trajectories = await session.finalize()
 
     assert len(trajectories) == 1
-    assert _decode_response_ids(trajectories[0].response_ids) == "FIRST"
-    assert trajectories[0].response_mask == [1] * len("FIRST")
+    assert _decode_response_ids(trajectories[0].response_ids).endswith("SECOND")
+    assert 0 in trajectories[0].response_mask
 
 
 @pytest.mark.asyncio
 async def test_multiple_chains_new_chain_backend_failure_does_not_leave_partial_chain():
+    """Avoid creating partial state when a new-chain backend request fails."""
     session = _session("new-chain-backend-failure")
     backend = SequencedBackend(["MAIN", RuntimeError("boom")])
     main_messages = [HELPFUL_SYS, {"role": "user", "content": "main request"}]
@@ -771,6 +685,7 @@ async def test_multiple_chains_new_chain_backend_failure_does_not_leave_partial_
 
 @pytest.mark.asyncio
 async def test_multiple_chains_length_exhaustion_closes_selected_chain_and_orders_it_last():
+    """Close and order the selected chain when its response budget is exhausted."""
     session = _session("length-close", response_length=len("MAIN1") + 1)
     backend = SequencedBackend(["MAIN1", "SUB"])
     main_first = [HELPFUL_SYS, {"role": "user", "content": "main"}]
@@ -796,93 +711,40 @@ async def test_multiple_chains_length_exhaustion_closes_selected_chain_and_order
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_length_exhaustion_surviving_chain_still_continues():
-    # Generous budget so only the deliberately oversized main continuation length-closes; the
-    # subagent chain stays well under budget and must remain active and continuable afterwards.
-    session = _session("length-close-survivor", response_length=200)
-    backend = SequencedBackend(["MAIN1", "SUB", "SUB2"])
-    main_first = [HELPFUL_SYS, {"role": "user", "content": "main"}]
-    subagent = [SUBAGENT_SYS, {"role": "user", "content": "sub"}]
-    main_too_long = [
-        HELPFUL_SYS,
-        {"role": "user", "content": "main"},
-        {"role": "assistant", "content": "MAIN1"},
-        {"role": "user", "content": "L" * 400},
-    ]
-    subagent_continue = [
-        SUBAGENT_SYS,
-        {"role": "user", "content": "sub"},
-        {"role": "assistant", "content": "SUB"},
-        {"role": "user", "content": "go"},
+async def test_multiple_chains_exactly_exhausted_chain_closes_without_backend_call():
+    """Close an exhausted chain even when the repeated request has no incremental tail."""
+    session = _session("chain-budget-exhausted", response_length=len("NORMAL"))
+    backend = SequencedBackend(["NORMAL", "SHOULD_NOT_RUN"])
+    first_messages = [{"role": "user", "content": "fill the response budget"}]
+    repeated_history = [
+        *first_messages,
+        {"role": "assistant", "content": "NORMAL"},
     ]
 
-    await _run(session, backend, main_first)
-    await _run(session, backend, subagent)
-    main_outcome = await _run(session, backend, main_too_long)
-
-    # The main chain length-closes, but the subagent chain survives as the only active chain.
-    assert main_outcome.finish_reason == "length"
-    snapshot = session.snapshot_state()
-    assert snapshot["num_active_chains"] == 1
-    assert snapshot["active_chain_ids"] == [2]
-
-    # The surviving subagent chain still accepts a further continuation and commits it.
-    sub_continue_outcome = await _run(session, backend, subagent_continue)
-    assert sub_continue_outcome.finish_reason == "stop"
-    assert backend.steps == []
-    assert session.snapshot_state()["active_chain_ids"] == [2]
-
-    trajectories = await session.finalize()
-    assert len(trajectories) == 2
-    # The subagent continuation is the last visible interaction, so order_seq puts it last.
-    sub_decoded = _decode_response_ids(trajectories[-1].response_ids)
-    assert sub_decoded.startswith("SUB")
-    assert sub_decoded.endswith("SUB2")
-    # The length-closed main chain is retained, ordered before the later subagent interaction.
-    assert trajectories[0].extra_fields["materialization_reason"] == "max_response_length"
-    assert _decode_response_ids(trajectories[0].response_ids) == "MAIN1"
-
-
-@pytest.mark.asyncio
-async def test_multiple_chains_new_chain_over_budget_clamps_not_early_returns():
-    session = _session("new-chain-clamp", response_length=0)
-    backend = SequencedBackend(["NORMAL"])
-
-    outcome = await _run(
-        session,
-        backend,
-        [{"role": "user", "content": "new chain should still call backend"}],
-        max_tokens=8,
-    )
-    # The over-budget new chain still went through the backend (clamped), so it is an active
-    # chain, not an early-closed one. Assert before finalize, which clears active_chains.
-    assert session.snapshot_state()["num_active_chains"] == 1
-
+    await _run(session, backend, first_messages)
+    outcome = await _run(session, backend, repeated_history)
     trajectories = await session.finalize()
 
+    assert outcome.finish_reason == "length"
     assert len(backend.calls) == 1
-    assert backend.calls[-1]["sampling_params"]["max_tokens"] == 0
-    assert outcome.finish_reason == "stop"
+    assert backend.steps == ["SHOULD_NOT_RUN"]
     assert len(trajectories) == 1
-    assert _decode_response_ids(trajectories[0].response_ids) == "NORMAL"
-    assert trajectories[0].response_mask == [1] * len("NORMAL")
+    assert trajectories[0].extra_fields["materialization_reason"] == "max_response_length"
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_existing_chain_over_budget_clamps_to_zero():
-    session = _session("existing-chain-clamp", response_length=0)
-    backend = SequencedBackend(["NORMAL", "SECOND"])
-    messages = [{"role": "user", "content": "request that already exceeded budget"}]
+async def test_multiple_chains_sets_remaining_budget_when_request_omits_max_tokens():
+    session = _session("default-max-tokens-budget", response_length=10)
+    backend = SequencedBackend(["A"])
 
-    await _run(session, backend, messages, max_tokens=8)
-    await _run(session, backend, list(session.active_chains[0].message_history), max_tokens=8)
+    await _run(session, backend, [{"role": "user", "content": "use session budget"}])
 
-    assert len(backend.calls) == 2
-    assert backend.calls[-1]["sampling_params"]["max_tokens"] == 0
+    assert backend.calls[0]["sampling_params"]["max_tokens"] == 10
 
 
 @pytest.mark.asyncio
 async def test_multiple_chains_multimodal_media_stays_chain_local():
+    """Keep image media isolated between independently selected chains."""
     session = _session(
         "mm-chain-local",
         processor=FakeProcessor(),
@@ -919,6 +781,7 @@ async def test_multiple_chains_multimodal_media_stays_chain_local():
 
 @pytest.mark.asyncio
 async def test_multiple_chains_video_media_stays_chain_local():
+    """Keep video media and metadata isolated between sibling chains."""
     session = _session(
         "video-chain-local",
         processor=FakeProcessor(),
@@ -955,21 +818,47 @@ async def test_multiple_chains_video_media_stays_chain_local():
     assert trajectories[1].multi_modal_data == {"videos": [main_video]}
 
 
+@pytest.mark.parametrize(
+    ("media_kind", "message_factory", "extractor", "sent_url", "unsent_url", "backend_field", "trajectory_key"),
+    [
+        (
+            "image",
+            _image_message,
+            fake_vision_info_extractor,
+            "image://sent-a.png",
+            "image://unsent-b.png",
+            "image_data",
+            "images",
+        ),
+        (
+            "video",
+            _video_message,
+            _codec_compatible_video_extractor,
+            "video://sent-a.mp4",
+            "video://unsent-b.mp4",
+            "video_data",
+            "videos",
+        ),
+    ],
+)
 @pytest.mark.asyncio
-async def test_multiple_chains_length_exhaustion_with_incremental_media_does_not_record_unsent_media():
+async def test_multiple_chains_length_exhaustion_does_not_materialize_unsent_media(
+    media_kind, message_factory, extractor, sent_url, unsent_url, backend_field, trajectory_key
+):
     session = _session(
-        "length-incremental-media",
+        f"length-unsent-{media_kind}",
         response_length=len("FIRST") + 1,
         processor=FakeProcessor(),
-        vision_info_extractor=fake_vision_info_extractor,
+        vision_info_extractor=extractor,
     )
     backend = SequencedBackend(["FIRST", "SHOULD_NOT_RUN"])
-    first_messages = [_image_message("image://sent-a.png", "describe first")]
+    first_messages = [message_factory(sent_url, "describe first")]
     exhausted_messages = [
-        _image_message("image://sent-a.png", "describe first"),
+        *first_messages,
         {"role": "assistant", "content": "FIRST"},
-        _image_message("image://unsent-b.png", "new media that exhausts length"),
+        message_factory(unsent_url, "new media that exhausts length"),
     ]
+    expected_sent = [sent_url] if media_kind == "image" else [(sent_url, {"url": sent_url})]
 
     await _run(session, backend, first_messages)
     outcome = await _run(session, backend, exhausted_messages)
@@ -978,92 +867,54 @@ async def test_multiple_chains_length_exhaustion_with_incremental_media_does_not
     assert outcome.finish_reason == "length"
     assert len(backend.calls) == 1
     assert backend.steps == ["SHOULD_NOT_RUN"]
-    assert backend.calls[0]["image_data"] == ["image://sent-a.png"]
+    assert backend.calls[0][backend_field] == expected_sent
     assert len(trajectories) == 1
-    assert _decode_response_ids(trajectories[0].response_ids) == "FIRST"
-    assert trajectories[0].multi_modal_data == {"images": ["image://sent-a.png"]}
+    assert trajectories[0].multi_modal_data == {trajectory_key: expected_sent}
     assert trajectories[0].extra_fields["materialization_reason"] == "max_response_length"
-    assert trajectories[0].num_turns == 3
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_length_exhaustion_with_incremental_video_does_not_record_unsent_video():
-    session = _session(
-        "length-incremental-video",
-        response_length=len("FIRST") + 1,
-        processor=FakeProcessor(),
-        vision_info_extractor=_codec_compatible_video_extractor,
-    )
-    backend = SequencedBackend(["FIRST", "SHOULD_NOT_RUN"])
-    sent_video = ("video://sent-a.mp4", {"url": "video://sent-a.mp4"})
-    unsent_video = ("video://unsent-b.mp4", {"url": "video://unsent-b.mp4"})
-    first_messages = [_video_message("video://sent-a.mp4", "describe first video")]
-    exhausted_messages = [
-        _video_message("video://sent-a.mp4", "describe first video"),
-        {"role": "assistant", "content": "FIRST"},
-        _video_message("video://unsent-b.mp4", "new video that exhausts length"),
-    ]
-
-    await _run(session, backend, first_messages)
-    outcome = await _run(session, backend, exhausted_messages)
-    trajectories = await session.finalize()
-
-    assert outcome.finish_reason == "length"
-    assert len(backend.calls) == 1
-    assert backend.steps == ["SHOULD_NOT_RUN"]
-    assert backend.calls[0]["video_data"] == [sent_video]
-    assert len(trajectories) == 1
-    assert _decode_response_ids(trajectories[0].response_ids) == "FIRST"
-    assert trajectories[0].multi_modal_data == {"videos": [sent_video]}
-    assert unsent_video not in trajectories[0].multi_modal_data["videos"]
-    assert trajectories[0].extra_fields["materialization_reason"] == "max_response_length"
-    assert trajectories[0].num_turns == 3
-
-
-@pytest.mark.asyncio
-async def test_multiple_chains_abort_clears_length_materialized_chains_from_snapshot():
+async def test_multiple_chains_abort_clears_length_materialized_trajectories():
     session = _session("abort-clears-materialized", response_length=len("FIRST") + 1)
     backend = SequencedBackend(["FIRST", "SHOULD_NOT_RUN"])
     first_messages = [{"role": "user", "content": "first turn"}]
     exhausted_messages = [
-        {"role": "user", "content": "first turn"},
+        *first_messages,
         {"role": "assistant", "content": "FIRST"},
         {"role": "user", "content": "this continuation exhausts the length budget"},
     ]
 
     await _run(session, backend, first_messages)
     outcome = await _run(session, backend, exhausted_messages)
-    before_abort = session.snapshot_state()
 
     assert outcome.finish_reason == "length"
-    assert before_abort["num_trajectories"] == 1
-    assert before_abort["active_chain_ids"] == []
+    assert session.snapshot_state()["num_trajectories"] == 1
 
     await session.abort()
-    after_abort = session.snapshot_state()
 
-    assert after_abort["phase"] == "ABORTED"
-    assert after_abort["num_trajectories"] == 0
-    assert after_abort["num_active_chains"] == 0
-    assert after_abort["active_chain_ids"] == []
-    assert after_abort["active_chain_tip_hashes"] == {}
+    state = session.snapshot_state()
+    assert state["phase"] == "ABORTED"
+    assert state["num_trajectories"] == 0
+    assert state["num_active_chains"] == 0
     with pytest.raises(RuntimeError, match="aborted"):
         await session.finalize()
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_committed_media_is_not_mutated_by_external_lists():
+async def test_multiple_chains_backend_media_list_mutation_does_not_change_committed_chain():
+    class _MutatingMediaBackend:
+        async def generate(self, request_id, *, prompt_ids, sampling_params, image_data=None, video_data=None):
+            image_data.append("image://backend-mutated.png")
+            return TokenOutput(token_ids=_ids("FIRST"), log_probs=[-0.1] * len("FIRST"), stop_reason="completed")
+
     session = _session(
-        "mutable-media",
+        "backend-mutates-media",
         processor=FakeProcessor(),
         vision_info_extractor=fake_vision_info_extractor,
     )
-    backend = SequencedBackend(["FIRST"])
-    initial_message = _image_message("image://stable-a.png", "describe stable")
+    backend = _MutatingMediaBackend()
 
-    await _run(session, backend, [initial_message])
-    backend.calls[0]["image_data"].append("image://backend-mutated.png")
-    initial_message["content"][0]["image_url"]["url"] = "image://message-mutated.png"
+    await _run(session, backend, [_image_message("image://stable-a.png", "describe stable")])
     trajectories = await session.finalize()
 
     assert len(trajectories) == 1
@@ -1071,107 +922,10 @@ async def test_multiple_chains_committed_media_is_not_mutated_by_external_lists(
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_media_objects_are_list_copied_without_deepcopy():
-    class NonDeepCopyableImage:
-        def __deepcopy__(self, memo):
-            raise RuntimeError("media object should not be deep-copied")
-
-    image = NonDeepCopyableImage()
-
-    async def vision_info_extractor(messages, image_patch_size, config=None):
-        assert image_patch_size == 16
-        return [image], None
-
-    session = _session(
-        "non-deepcopyable-media",
-        processor=FakeProcessor(),
-        vision_info_extractor=vision_info_extractor,
-    )
-    backend = SequencedBackend(["FIRST"])
-
-    outcome = await _run(session, backend, [_image_message("image://raw.png", "describe raw")])
-    trajectories = await session.finalize()
-
-    assert outcome.finish_reason == "stop"
-    assert len(backend.calls) == 1
-    assert backend.calls[0]["image_data"][0] is image
-    assert len(trajectories) == 1
-    assert trajectories[0].multi_modal_data["images"][0] is image
-    assert backend.calls[0]["image_data"] is not trajectories[0].multi_modal_data["images"]
-
-
-@pytest.mark.asyncio
-async def test_multiple_chains_late_commit_after_finalize_is_rejected_without_mutating_session():
-    session = _session("late-finalize")
-    await _run(session, SequencedBackend(["FIRST"]), [{"role": "user", "content": "first turn"}])
-    before_late = session.snapshot_state()
-    delayed_backend = _DelayedBackend("SECOND")
-    late_task = asyncio.create_task(
-        _run(
-            session,
-            delayed_backend,
-            [
-                {"role": "user", "content": "first turn"},
-                {"role": "assistant", "content": "FIRST"},
-                {"role": "user", "content": "follow up"},
-            ],
-        )
-    )
-
-    await asyncio.wait_for(delayed_backend.entered.wait(), timeout=5)
-    trajectories = await session.finalize()
-    delayed_backend.release.set()
-    with pytest.raises(HTTPException) as exc_info:
-        await late_task
-
-    assert exc_info.value.status_code == 409
-    assert [_decode_response_ids(t.response_ids) for t in trajectories] == ["FIRST"]
-    state = session.snapshot_state()
-    assert state["phase"] == "FINALIZED"
-    assert state["num_active_chains"] == 0
-    assert delayed_backend.calls[0]["request_id"] == "late-finalize"
-    assert before_late["active_chain_ids"] == [1]
-
-
-@pytest.mark.asyncio
-async def test_multiple_chains_late_commit_after_abort_is_rejected_without_advancing_chain():
-    session = _session("late-abort")
-    await _run(session, SequencedBackend(["FIRST"]), [{"role": "user", "content": "first turn"}])
-    before_late = session.snapshot_state()
-    delayed_backend = _DelayedBackend("SECOND")
-    late_task = asyncio.create_task(
-        _run(
-            session,
-            delayed_backend,
-            [
-                {"role": "user", "content": "first turn"},
-                {"role": "assistant", "content": "FIRST"},
-                {"role": "user", "content": "follow up"},
-            ],
-        )
-    )
-
-    await asyncio.wait_for(delayed_backend.entered.wait(), timeout=5)
-    await session.abort()
-    delayed_backend.release.set()
-    with pytest.raises(HTTPException) as exc_info:
-        await late_task
-
-    assert exc_info.value.status_code == 409
-    after_late = session.snapshot_state()
-    assert after_late["phase"] == "ABORTED"
-    assert before_late["active_chain_ids"] == [1]
-    assert after_late["active_chain_ids"] == []
-    assert after_late["active_chain_tip_hashes"] == {}
-    assert after_late["has_active_trajectory"] is False
-    with pytest.raises(RuntimeError, match="aborted"):
-        await session.finalize()
-
-
-@pytest.mark.asyncio
 @pytest.mark.parametrize("terminal_action", ["finalize", "abort"])
-async def test_multiple_chains_parallel_terminal_state_rejects_late_commit_and_clears_inflight(terminal_action):
-    session = _session(f"parallel-late-{terminal_action}", enable_parallel_session_generation=True)
+async def test_multiple_chains_terminal_state_rejects_late_commit(terminal_action):
+    """Reject a backend result that arrives after finalization or abort."""
+    session = _session(f"parallel-late-{terminal_action}")
     await _run(session, SequencedBackend(["FIRST"]), [{"role": "user", "content": "first turn"}])
     pending_backend = _ControlledParallelBackend(["SECOND"])
     pending_task = asyncio.create_task(
@@ -1186,7 +940,6 @@ async def test_multiple_chains_parallel_terminal_state_rejects_late_commit_and_c
         )
     )
     await pending_backend.wait_for_calls(1)
-    assert session.snapshot_state()["num_inflight_generations"] == 1
 
     if terminal_action == "finalize":
         terminal_result = await session.finalize()
@@ -1198,151 +951,105 @@ async def test_multiple_chains_parallel_terminal_state_rejects_late_commit_and_c
     with pytest.raises(HTTPException) as exc_info:
         await pending_task
     assert exc_info.value.status_code == 409
-    assert session.snapshot_state()["num_inflight_generations"] == 0
     assert session.snapshot_state()["active_chain_ids"] == []
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_parallel_length_close_races_with_backend_success():
-    session = _session(
-        "parallel-length-race",
-        response_length=len("BASE") + 1,
-        enable_parallel_session_generation=True,
-    )
+async def test_multiple_chains_reserved_chain_is_not_closed_by_concurrent_length_request():
+    """Split rather than length-close a matching chain reserved by another request."""
+    session = _session("reserved-length", response_length=len("BASE") + 1)
     await _run(session, SequencedBackend(["BASE"]), [{"role": "user", "content": "base"}])
-    pending_backend = _ControlledParallelBackend(["STALE"])
+    pending_backend = _ControlledParallelBackend(["CONT"])
     pending_messages = list(session.active_chains[0].message_history)
     pending_task = asyncio.create_task(_run(session, pending_backend, pending_messages))
     await pending_backend.wait_for_calls(1)
 
-    length_outcome = await _run(
+    split_outcome = await _run(
         session,
-        SequencedBackend(["SHOULD_NOT_RUN"]),
+        SequencedBackend(["FRESH"]),
         [
             {"role": "user", "content": "base"},
             {"role": "assistant", "content": "BASE"},
             {"role": "user", "content": "this continuation is long enough to close the chain"},
         ],
     )
-    assert length_outcome.finish_reason == "length"
-    assert session.snapshot_state()["active_chain_ids"] == []
-    assert session.snapshot_state()["num_trajectories"] == 1
+    assert split_outcome.finish_reason == "stop"
+    assert session.snapshot_state()["active_chain_ids"] == [1, 2]
+    assert session.snapshot_state()["num_trajectories"] == 0
+    split_chain = next(chain for chain in session.active_chains if chain.chain_id == 2)
+    assert split_chain.buffer.response_ids == _ids("FRESH")
+    assert split_chain.buffer.response_mask == [1] * len("FRESH")
 
     pending_backend.release_call(0)
     await pending_task
-    assert session.snapshot_state()["active_chain_ids"] == [2]
+    assert session.snapshot_state()["active_chain_ids"] == [1, 2]
 
     trajectories = await session.finalize()
     decoded = [_decode_response_ids(trajectory.response_ids) for trajectory in trajectories]
     assert len(trajectories) == 2
-    assert trajectories[0].extra_fields["materialization_reason"] == "max_response_length"
-    assert decoded[0] == "BASE"
-    assert decoded[1].endswith("STALE")
+    assert all("materialization_reason" not in trajectory.extra_fields for trajectory in trajectories)
+    assert any(text.endswith("CONT") for text in decoded)
+    assert "FRESH" in decoded
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_parallel_backend_failure_clears_inflight_without_chain_mutation():
-    session = _session("parallel-failure", enable_parallel_session_generation=True)
-    await _run(session, SequencedBackend(["FIRST"]), [{"role": "user", "content": "first turn"}])
-    before_failure = session.snapshot_state()
-    failing_backend = _ControlledParallelBackend([RuntimeError("boom")])
-    failing_task = asyncio.create_task(
-        _run(
-            session,
-            failing_backend,
-            [
-                {"role": "user", "content": "first turn"},
-                {"role": "assistant", "content": "FIRST"},
-                {"role": "user", "content": "follow up"},
-            ],
-        )
-    )
-    await failing_backend.wait_for_calls(1)
-    assert session.snapshot_state()["num_inflight_generations"] == 1
-
-    failing_backend.release_call(0)
-    with pytest.raises(HTTPException) as exc_info:
-        await failing_task
-
-    assert exc_info.value.status_code == 500
-    after_failure = session.snapshot_state()
-    assert after_failure["num_inflight_generations"] == 0
-    assert after_failure["active_chain_ids"] == before_failure["active_chain_ids"]
-    assert after_failure["active_chain_tip_hashes"] == before_failure["active_chain_tip_hashes"]
-    trajectories = await session.finalize()
-    assert [_decode_response_ids(trajectory.response_ids) for trajectory in trajectories] == ["FIRST"]
-
-
-@pytest.mark.asyncio
-async def test_multiple_chains_parallel_decode_failure_clears_inflight_without_chain_mutation(monkeypatch):
-    session = _session("parallel-decode-failure", enable_parallel_session_generation=True)
-    await _run(session, SequencedBackend(["FIRST"]), [{"role": "user", "content": "first turn"}])
-    before_failure = session.snapshot_state()
+async def test_multiple_chains_decode_failure_releases_reserved_chain_for_retry(monkeypatch):
+    """Release an existing-chain reservation when response decoding fails."""
+    session = _session("decode-failure")
+    first_messages = [{"role": "user", "content": "first turn"}]
+    continuation = [
+        *first_messages,
+        {"role": "assistant", "content": "FIRST"},
+        {"role": "user", "content": "follow up"},
+    ]
+    await _run(session, SequencedBackend(["FIRST"]), first_messages)
 
     async def decode_response_raises(*args, **kwargs):
         raise RuntimeError("decode boom")
 
-    monkeypatch.setattr(session._codec, "decode_response", decode_response_raises)
-
-    with pytest.raises(HTTPException) as exc_info:
-        await _run(
-            session,
-            SequencedBackend(["SECOND"]),
-            [
-                {"role": "user", "content": "first turn"},
-                {"role": "assistant", "content": "FIRST"},
-                {"role": "user", "content": "follow up"},
-            ],
-        )
+    with monkeypatch.context() as patch:
+        patch.setattr(session._codec, "decode_response", decode_response_raises)
+        with pytest.raises(HTTPException) as exc_info:
+            await _run(session, SequencedBackend(["IGNORED"]), continuation)
     assert exc_info.value.status_code == 500
     assert "decode boom" in str(exc_info.value.detail)
 
-    after_failure = session.snapshot_state()
-    assert after_failure["num_inflight_generations"] == 0
-    assert after_failure["active_chain_ids"] == before_failure["active_chain_ids"]
-    assert after_failure["active_chain_tip_hashes"] == before_failure["active_chain_tip_hashes"]
-    assert after_failure["active_chain_updated_seq"] == before_failure["active_chain_updated_seq"]
-    assert after_failure["num_trajectories"] == before_failure["num_trajectories"] == 0
+    await _run(session, SequencedBackend(["SECOND"]), continuation)
+    assert session.snapshot_state()["active_chain_ids"] == [1]
     trajectories = await session.finalize()
-    assert [_decode_response_ids(trajectory.response_ids) for trajectory in trajectories] == ["FIRST"]
+    assert len(trajectories) == 1
+    assert _decode_response_ids(trajectories[0].response_ids).endswith("SECOND")
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_parallel_cancelled_generation_clears_inflight_without_chain_mutation():
-    session = _session("parallel-cancelled", enable_parallel_session_generation=True)
-    await _run(session, SequencedBackend(["FIRST"]), [{"role": "user", "content": "first turn"}])
-    before_cancel = session.snapshot_state()
+async def test_multiple_chains_cancelled_generation_releases_reserved_chain_for_retry():
+    """Release an existing-chain reservation when generation is cancelled."""
+    session = _session("cancelled")
+    first_messages = [{"role": "user", "content": "first turn"}]
+    continuation = [
+        *first_messages,
+        {"role": "assistant", "content": "FIRST"},
+        {"role": "user", "content": "follow up"},
+    ]
+    await _run(session, SequencedBackend(["FIRST"]), first_messages)
     pending_backend = _ControlledParallelBackend(["SECOND"])
-    pending_task = asyncio.create_task(
-        _run(
-            session,
-            pending_backend,
-            [
-                {"role": "user", "content": "first turn"},
-                {"role": "assistant", "content": "FIRST"},
-                {"role": "user", "content": "follow up"},
-            ],
-        )
-    )
+    pending_task = asyncio.create_task(_run(session, pending_backend, continuation))
     await pending_backend.wait_for_calls(1)
-    assert session.snapshot_state()["num_inflight_generations"] == 1
 
     pending_task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await pending_task
-    await _wait_for_no_inflight(session)
 
-    after_cancel = session.snapshot_state()
-    assert after_cancel["active_chain_ids"] == before_cancel["active_chain_ids"]
-    assert after_cancel["active_chain_tip_hashes"] == before_cancel["active_chain_tip_hashes"]
-    assert after_cancel["active_chain_updated_seq"] == before_cancel["active_chain_updated_seq"]
-    assert after_cancel["num_trajectories"] == before_cancel["num_trajectories"] == 0
+    await _run(session, SequencedBackend(["RETRY"]), continuation)
+    assert session.snapshot_state()["active_chain_ids"] == [1]
     trajectories = await session.finalize()
-    assert [_decode_response_ids(trajectory.response_ids) for trajectory in trajectories] == ["FIRST"]
+    assert len(trajectories) == 1
+    assert _decode_response_ids(trajectories[0].response_ids).endswith("RETRY")
 
 
 @pytest.mark.asyncio
 async def test_multiple_chains_prefix_content_change_does_not_reuse_chain_and_hashes_match_history():
+    """Split on changed prefix content and keep stored hashes aligned with history."""
     session = _session("hash-prefix-content")
     backend = SequencedBackend(["FIRST", "SECOND"])
 
@@ -1365,35 +1072,8 @@ async def test_multiple_chains_prefix_content_change_does_not_reuse_chain_and_ha
     assert all(t.response_mask == [1] * len(t.response_ids) for t in trajectories)
 
 
-@pytest.mark.asyncio
-async def test_multiple_chains_hash_prefixes_extend_on_commit():
-    session = _session("hash-extend")
-    backend = SequencedBackend(["FIRST", "SECOND"])
-
-    await _run(session, backend, [{"role": "user", "content": "turn one"}])
-    chain = session.active_chains[0]
-    # turn 1 commit -> history is [user, assistant FIRST]
-    assert len(chain.message_prefix_hashes) == len(chain.message_history) == 2
-    hashes_after_first = list(chain.message_prefix_hashes)
-
-    await _run(
-        session,
-        backend,
-        [
-            {"role": "user", "content": "turn one"},
-            {"role": "assistant", "content": "FIRST"},
-            {"role": "user", "content": "turn two"},
-        ],
-    )
-    chain = session.active_chains[0]
-    # continuation commit -> history is [user, assistant FIRST, user, assistant SECOND]
-    assert len(chain.message_prefix_hashes) == len(chain.message_history) == 4
-    # Continuation must preserve the earlier prefix-hash entries byte-for-byte and only
-    # append new hashes for the incremental context + assistant message.
-    assert chain.message_prefix_hashes[: len(hashes_after_first)] == hashes_after_first
-
-
 def test_compute_message_prefix_hashes_canonicalizes_json_tool_call_arguments():
+    """Canonicalize JSON-equivalent tool arguments before computing prefix hashes."""
     session = _session("hash-tool-arguments")
 
     def assistant_tool_call(arguments) -> dict:
@@ -1421,10 +1101,15 @@ def test_compute_message_prefix_hashes_canonicalizes_json_tool_call_arguments():
 
 
 @pytest.mark.asyncio
-async def test_multiple_chains_tool_call_assistant_echo_hits_same_chain(monkeypatch):
+@pytest.mark.parametrize("rewrite_fresh_tool_result_id", [False, True], ids=["matching-id", "rewritten-fresh-id"])
+async def test_multiple_chains_tool_call_echo_reuses_chain_despite_fresh_tool_result_id(
+    rewrite_fresh_tool_result_id,
+    monkeypatch,
+):
     import uni_agent.gateway.session.codec as codec_mod
 
     monkeypatch.setattr(codec_mod, "_extract_tool_calls_with_sglang_or_vllm", _fake_tool_call_dispatch)
+    """Match on the committed prefix; a fresh tool-result ID is outside that boundary."""
     session = _session("tool-call-echo", tool_parser_name="hermes")
     tools = [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}]
     tool_call_text = '<tool_call>\n{"name": "search", "arguments": {"query": "weather"}}\n</tool_call>'
@@ -1439,6 +1124,9 @@ async def test_multiple_chains_tool_call_assistant_echo_hits_same_chain(monkeypa
     first_chain_ids = session.snapshot_state()["active_chain_ids"]
     assert first.finish_reason == "tool_calls"
     assert first.assistant_msg["tool_calls"][0]["function"]["name"] == "search"
+    tool_result_id = (
+        "call_rewritten_fresh_tail" if rewrite_fresh_tool_result_id else first.assistant_msg["tool_calls"][0]["id"]
+    )
 
     await _run(
         session,
@@ -1452,7 +1140,7 @@ async def test_multiple_chains_tool_call_assistant_echo_hits_same_chain(monkeypa
             },
             {
                 "role": "tool",
-                "tool_call_id": first.assistant_msg["tool_calls"][0]["id"],
+                "tool_call_id": tool_result_id,
                 "content": "sunny and warm",
             },
         ],
@@ -1528,6 +1216,7 @@ async def test_multiple_chains_tool_call_id_rewrite_hits_same_chain(monkeypatch)
     ],
 )
 async def test_multiple_chains_response_logprobs_stay_aligned_or_none(steps, expected_logprobs):
+    """Return aligned response logprobs only when every generated segment is covered."""
     session = _session(f"logprobs-{expected_logprobs}")
     backend = _LogprobBackend(steps)
 
