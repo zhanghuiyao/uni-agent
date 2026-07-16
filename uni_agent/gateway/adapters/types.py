@@ -54,12 +54,7 @@ class OpenAIChatCompletionTool(TypedDict, total=False):
 
 
 class OpenAIChatCompletionRequest(TypedDict, total=False):
-    """Incoming ``POST /v1/chat/completions`` request body shape.
-
-    ``chat_template_kwargs`` is included only so the adapter can reject the
-    unsupported request-level extension. Chat-template options are configured
-    at the gateway/model level.
-    """
+    """Incoming ``POST /v1/chat/completions`` request body shape."""
 
     model: str
     messages: list[OpenAIChatMessage]
@@ -68,7 +63,6 @@ class OpenAIChatCompletionRequest(TypedDict, total=False):
     stream: bool
     n: int
     response_format: Any
-    chat_template_kwargs: dict[str, Any]
     temperature: float
     top_p: float
     top_k: int

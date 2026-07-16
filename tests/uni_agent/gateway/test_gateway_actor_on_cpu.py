@@ -1158,14 +1158,6 @@ async def test_gateway_actor_parallel_same_session_requests_by_default():
             {
                 "model": "dummy-model",
                 "messages": [{"role": "user", "content": "hello"}],
-                "chat_template_kwargs": {},
-            },
-            "request-level chat_template_kwargs is not supported",
-        ),
-        (
-            {
-                "model": "dummy-model",
-                "messages": [{"role": "user", "content": "hello"}],
                 "max_tokens": 0,
             },
             "max_tokens must be a positive integer",
