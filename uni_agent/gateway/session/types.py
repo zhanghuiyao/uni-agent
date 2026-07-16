@@ -62,6 +62,8 @@ class Trajectory:
         multi_modal_data: Optional image/video data associated with the prompt.
         extra_fields: Gateway-owned extension fields, such as trajectory
             materialization metadata consumed by training adapters.
+        messages: Optional normalized OpenAI-style message history captured for
+            debugging and artifact analysis.
     """
 
     prompt_ids: list[int]
@@ -74,3 +76,4 @@ class Trajectory:
     routed_experts: torch.Tensor | np.ndarray | None = None
     multi_modal_data: dict[str, Any] | None = None
     extra_fields: dict[str, Any] = field(default_factory=dict)
+    messages: list[dict[str, Any]] | None = None

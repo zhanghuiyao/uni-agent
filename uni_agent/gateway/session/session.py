@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import copy
 import hashlib
 import json
 import time
@@ -152,6 +153,7 @@ class GatewaySession:
         prompt_length: int | None = None,
         response_length: int | None = None,
         sampling_params: dict[str, Any] | None = None,
+        capture_messages: bool = False,
     ):
         """Create an active session bound to a handle and model codec."""
         if response_length is not None and response_length <= 0:
@@ -164,6 +166,7 @@ class GatewaySession:
         self._prompt_length = prompt_length
         self._response_length = response_length
         self._sampling_params = dict(sampling_params or {})
+        self._capture_messages = capture_messages
         self.active_chains: list[ChainState] = []
         self.materialized_chains: list[MaterializedChain] = []
         self.reserved_chain_ids: set[int] = set()
@@ -613,6 +616,7 @@ class GatewaySession:
                 chain.video_data,
             ),
             extra_fields=dict(extra_fields) if extra_fields else {},
+            messages=copy.deepcopy(chain.message_history) if self._capture_messages else None,
         )
 
     def _count_chat_turns(self, message_history: list[dict[str, Any]]) -> int:

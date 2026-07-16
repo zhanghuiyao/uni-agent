@@ -36,6 +36,7 @@ def _session(
     processor=None,
     vision_info_extractor=None,
     tool_parser_name: str | None = None,
+    capture_messages: bool = False,
 ) -> GatewaySession:
     return GatewaySession(
         SessionHandle(session_id=session_id),
@@ -48,6 +49,7 @@ def _session(
         ),
         response_length=response_length,
         sampling_params=sampling_params,
+        capture_messages=capture_messages,
     )
 
 
@@ -177,12 +179,13 @@ async def test_multiple_chains_linear_conversation_stays_single_chain():
     assert 0 in chain_trajectories[0].response_mask
     assert chain_trajectories[0].response_mask[-len("SECOND") :] == [1] * len("SECOND")
     assert chain_trajectories[0].reward_info == {"label": "linear"}
+    assert chain_trajectories[0].messages is None
 
 
 @pytest.mark.asyncio
 async def test_multiple_chains_subagent_system_split_returns_to_main_chain():
     """Split subagent history into a sibling and later resume the main chain."""
-    session = _session("subagent-return")
+    session = _session("subagent-return", capture_messages=True)
     backend = SequencedBackend(["Mango", "Blue", "Apple"])
     main_first = [HELPFUL_SYS, {"role": "user", "content": "name a fruit"}]
     subagent = [SUBAGENT_SYS, {"role": "user", "content": "name a color"}]
@@ -210,6 +213,8 @@ async def test_multiple_chains_subagent_system_split_returns_to_main_chain():
     assert "Blue" not in decoded[1]
     assert 0 in trajectories[1].response_mask
     assert trajectories[1].response_mask[-len("Apple") :] == [1] * len("Apple")
+    assert trajectories[0].messages == [*subagent, {"role": "assistant", "content": "Blue"}]
+    assert trajectories[1].messages == [*main_continuation, {"role": "assistant", "content": "Apple"}]
 
 
 @pytest.mark.asyncio
@@ -525,7 +530,7 @@ async def test_multiple_chains_new_chain_backend_failure_does_not_leave_partial_
 @pytest.mark.asyncio
 async def test_multiple_chains_length_exhaustion_closes_selected_chain_and_orders_it_last():
     """Close and order the selected chain when its response budget is exhausted."""
-    session = _session("length-close", response_length=len("MAIN1") + 1)
+    session = _session("length-close", response_length=len("MAIN1") + 1, capture_messages=True)
     backend = SequencedBackend(["MAIN1", "SUB"])
     main_first = [HELPFUL_SYS, {"role": "user", "content": "main"}]
     subagent = [SUBAGENT_SYS, {"role": "user", "content": "sub"}]
@@ -547,6 +552,9 @@ async def test_multiple_chains_length_exhaustion_closes_selected_chain_and_order
     assert _decode_response_ids(trajectories[0].response_ids) == "SUB"
     assert _decode_response_ids(trajectories[1].response_ids) == "MAIN1"
     assert trajectories[1].extra_fields["materialization_reason"] == "max_response_length"
+    assert trajectories[0].messages == [*subagent, {"role": "assistant", "content": "SUB"}]
+    assert trajectories[1].messages == [*main_first, {"role": "assistant", "content": "MAIN1"}]
+    assert main_too_long[-1] not in trajectories[1].messages
 
 
 @pytest.mark.asyncio
@@ -1007,6 +1015,44 @@ async def test_multiple_chains_tool_call_echo_reuses_chain_despite_fresh_tool_re
     assert decoded.startswith(tool_call_text)
     assert decoded.endswith("FINAL")
     assert 0 in trajectories[0].response_mask
+
+
+@pytest.mark.asyncio
+async def test_capture_messages_preserves_exact_tool_call_ids(monkeypatch):
+    import uni_agent.gateway.session.codec as codec_mod
+
+    monkeypatch.setattr(codec_mod, "_extract_tool_calls_with_sglang_or_vllm", _fake_tool_call_dispatch)
+    session = _session("capture-tool-ids", tool_parser_name="hermes", capture_messages=True)
+    tools = [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}]
+    backend = SequencedBackend(
+        [
+            '<tool_call>\n{"name": "search", "arguments": {"query": "weather"}}\n</tool_call>',
+            "FINAL",
+        ]
+    )
+    initial_messages = [{"role": "user", "content": "what is the weather?"}]
+
+    first = await _run(session, backend, initial_messages, tools=tools)
+    tool_call_id = first.assistant_msg["tool_calls"][0]["id"]
+    continuation = [
+        *initial_messages,
+        first.assistant_msg,
+        {"role": "tool", "tool_call_id": tool_call_id, "content": "sunny and warm"},
+    ]
+    await _run(session, backend, continuation, tools=tools)
+    trajectories = await session.finalize()
+
+    assert len(trajectories) == 1
+    captured = trajectories[0].messages
+    assert captured is not None
+    assert captured[-3]["tool_calls"][0]["id"] == tool_call_id
+    assert captured[-2]["tool_call_id"] == tool_call_id
+    assert captured[-1] == {"role": "assistant", "content": "FINAL"}
+
+    continuation[-1]["content"] = "mutated after finalize"
+    first.assistant_msg["tool_calls"][0]["id"] = "mutated"
+    assert captured[-3]["tool_calls"][0]["id"] == tool_call_id
+    assert captured[-2]["content"] == "sunny and warm"
 
 
 @pytest.mark.asyncio

@@ -702,8 +702,11 @@ class OpenAICompatibleAgentFramework(AgentFramework):
 
         extra_fields = dict(trajectory.extra_fields)
         extra_fields.pop("materialization_reason", None)
+        extra_fields.pop("messages", None)
         field.update(extra_fields)
         field.pop("multi_modal_data", None)
+        if trajectory.messages is not None:
+            field["messages"] = trajectory.messages
         for key in ("uid", "raw_prompt", "data_source", "reward_model", "extra_info", "tools_kwargs", "agent_name"):
             if key in sample_fields:
                 field[key] = sample_fields[key]

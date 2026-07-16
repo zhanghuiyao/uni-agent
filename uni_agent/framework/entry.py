@@ -46,6 +46,7 @@ def build_gateway_manager(*, config, llm_client) -> GatewayManager:
         apply_chat_template_kwargs=dict(apply_chat_template_kwargs),
         prompt_length=config.actor_rollout_ref.rollout.prompt_length,
         response_length=config.actor_rollout_ref.rollout.response_length,
+        capture_messages=bool(af_cfg.get("capture_messages", False)),
     )
 
     return GatewayManager(

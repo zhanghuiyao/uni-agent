@@ -73,6 +73,7 @@ class _GatewayActor:
         )
         self._prompt_length = config.prompt_length
         self._response_length = config.response_length
+        self._capture_messages = config.capture_messages
         self._sessions: dict[str, GatewaySession] = {}
         self._app = FastAPI()
         self._server_port: int | None = None
@@ -243,6 +244,7 @@ class _GatewayActor:
             prompt_length=self._prompt_length,
             response_length=self._response_length,
             sampling_params=sampling_params,
+            capture_messages=self._capture_messages,
         )
         return handle
 

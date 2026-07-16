@@ -29,6 +29,9 @@ class GatewayActorConfig:
         vision_info_extractor_kwargs: Static kwargs forwarded to the extractor.
         prompt_length: Optional prompt-token budget stored on gateway sessions.
         response_length: Optional response-token budget stored on gateway sessions.
+        capture_messages: Whether finalized trajectories include normalized
+            message histories. Disabled by default to avoid enlarging training
+            payloads or persisting sensitive prompt/tool content.
     """
 
     tokenizer: Any
@@ -41,6 +44,7 @@ class GatewayActorConfig:
     vision_info_extractor_kwargs: dict[str, Any] | None = None
     prompt_length: int | None = None
     response_length: int | None = None
+    capture_messages: bool = False
 
     def __post_init__(self) -> None:
         if self.response_length is not None and self.response_length <= 0:

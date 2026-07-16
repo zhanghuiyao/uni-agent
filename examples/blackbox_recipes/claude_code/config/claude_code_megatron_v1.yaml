@@ -57,6 +57,7 @@ actor_rollout_ref:
     custom:
       agent_framework:
         gateway_count: 1
+        capture_messages: false
         agent_runners:
           claude_code:
             runner_fqn: examples.blackbox_recipes.claude_code.claude_code_runner.claude_code_runner

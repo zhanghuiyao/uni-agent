@@ -22,6 +22,7 @@ import asyncio
 import json
 import logging
 import os
+import time
 from collections import defaultdict
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -132,6 +133,8 @@ def _load_config(
     run_timeout: int,
     enable_subagents: bool,
     require_subagent: bool,
+    disable_log_stats: bool = False,
+    save_trajectory_messages: bool = False,
 ) -> Any:
     """Compose the recipe's training config and override inference fields.
 
@@ -163,9 +166,11 @@ def _load_config(
     ro.n_gpus_per_node = n_gpus_per_node
     ro.calculate_log_probs = True
     ro.enable_sleep_mode = False
+    ro.disable_log_stats = disable_log_stats
 
     af = ro.custom.agent_framework
     af.gateway_count = gateway_count
+    af.capture_messages = save_trajectory_messages
     runner_name = next(iter(af.agent_runners.keys()))
     runner_cfg = af.agent_runners[runner_name]
     runner_cfg.max_concurrent_sessions = max_concurrent_sessions
@@ -221,9 +226,9 @@ def _json_safe(value: Any) -> Any:
         return value.item()
     if isinstance(value, dict):
         return {str(key): _json_safe(item) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
+    if isinstance(value, list | tuple):
         return [_json_safe(item) for item in value]
-    if value is None or isinstance(value, (str, int, float, bool)):
+    if value is None or isinstance(value, str | int | float | bool):
         return value
     return str(value)
 
@@ -235,7 +240,7 @@ def _field_item(fields, key: str, index: int, default=None) -> Any:
     if isinstance(value, torch.Tensor):
         if value.dim() > 0:
             value = value[index]
-    elif isinstance(value, (list, tuple)):
+    elif isinstance(value, list | tuple):
         value = value[index]
     return _json_safe(value)
 
@@ -264,22 +269,42 @@ def _sanitize_tag(value: Any) -> dict[str, Any]:
 def _reward_from_rm_scores(row: Any) -> float:
     if isinstance(row, list) and row:
         return float(row[-1])
-    if isinstance(row, (int, float)):
+    if isinstance(row, int | float):
         return float(row)
     return 0.0
 
 
-def _install_tq_capture() -> InferenceCapture:
+def _install_tq_capture(*, uids: list[str] | None = None) -> InferenceCapture:
     """Monkeypatch the process-local TransferQueue to capture inference outputs.
 
     Runner dispatch is a Ray task, but session finalize/score/TQ-writes happen
     in this driver process, so patching ``tq`` here captures every write.
     """
     capture = InferenceCapture()
+    uid_to_sample_index = {uid: index for index, uid in enumerate(uids or [])}
+    started_at = time.monotonic()
 
     async def _fake_put(*, key, partition_id=None, tag=None, **kwargs):
         if isinstance(tag, dict) and "status" in tag:
-            capture.uid_status[str(key)] = str(tag["status"])
+            uid = str(key)
+            is_first_completion = uid not in capture.uid_status
+            capture.uid_status[uid] = str(tag["status"])
+            if is_first_completion and uid in uid_to_sample_index:
+                sample_trajectories = [trajectory for trajectory in capture.trajectories if trajectory["uid"] == uid]
+                session_count = len({trajectory["session_index"] for trajectory in sample_trajectories})
+                completed_count = sum(completed_uid in uid_to_sample_index for completed_uid in capture.uid_status)
+                logger.info(
+                    "[progress] completed=%d/%d sample_index=%d uid=%s status=%s "
+                    "sessions=%d trajectories=%d elapsed=%.1fs",
+                    completed_count,
+                    len(uid_to_sample_index),
+                    uid_to_sample_index[uid],
+                    uid,
+                    capture.uid_status[uid],
+                    session_count,
+                    len(sample_trajectories),
+                    time.monotonic() - started_at,
+                )
 
     async def _fake_batch_put(*, keys=None, fields=None, tags=None, partition_id=None, **kwargs):
         if fields is None or keys is None:
@@ -290,25 +315,25 @@ def _install_tq_capture() -> InferenceCapture:
             rm_scores = _field_item(fields, "rm_scores", i, [])
             reward_score = _reward_from_rm_scores(rm_scores)
             capture.scores[str(key)] = reward_score
-            capture.trajectories.append(
-                {
-                    "uid": uid,
-                    "session_index": session_index,
-                    "trajectory_index": trajectory_index,
-                    "is_final_trajectory": i == len(keys) - 1,
-                    "data_source": _field_item(fields, "data_source", i),
-                    "prompt_ids": _field_item(fields, "prompts", i, []),
-                    "response_ids": _field_item(fields, "responses", i, []),
-                    "response_mask": _field_item(fields, "response_mask", i, []),
-                    "response_logprobs": _field_item(fields, "rollout_log_probs", i, []),
-                    "reward_score": reward_score,
-                    "num_turns": int(_field_item(fields, "num_turns", i, 0)),
-                    "reward_extra_info": _sanitize_reward_extra_info(
-                        _field_item(fields, "reward_extra_info", i, {})
-                    ),
-                    "tags": _sanitize_tag(tag_list[i]),
-                }
-            )
+            trajectory = {
+                "uid": uid,
+                "session_index": session_index,
+                "trajectory_index": trajectory_index,
+                "is_final_trajectory": i == len(keys) - 1,
+                "data_source": _field_item(fields, "data_source", i),
+                "prompt_ids": _field_item(fields, "prompts", i, []),
+                "response_ids": _field_item(fields, "responses", i, []),
+                "response_mask": _field_item(fields, "response_mask", i, []),
+                "response_logprobs": _field_item(fields, "rollout_log_probs", i, []),
+                "reward_score": reward_score,
+                "num_turns": int(_field_item(fields, "num_turns", i, 0)),
+                "reward_extra_info": _sanitize_reward_extra_info(_field_item(fields, "reward_extra_info", i, {})),
+                "tags": _sanitize_tag(tag_list[i]),
+            }
+            messages = _field_item(fields, "messages", i)
+            if messages is not None:
+                trajectory["messages"] = messages
+            capture.trajectories.append(trajectory)
 
     tq.async_kv_put = _fake_put
     tq.async_kv_batch_put = _fake_batch_put
@@ -514,6 +539,8 @@ def run_inference(
     enable_subagents: bool,
     require_subagent: bool,
     output_dir: str | None,
+    disable_log_stats: bool = False,
+    save_trajectory_messages: bool = False,
 ) -> dict[str, Any]:
     if require_subagent and not enable_subagents:
         raise ValueError("require_subagent=True requires enable_subagents=True")
@@ -538,6 +565,8 @@ def run_inference(
         run_timeout=run_timeout,
         enable_subagents=enable_subagents,
         require_subagent=require_subagent,
+        disable_log_stats=disable_log_stats,
+        save_trajectory_messages=save_trajectory_messages,
     )
 
     samples = load_swe_dataset(data_path, max_samples=max_samples)
@@ -557,7 +586,7 @@ def run_inference(
     )
 
     prompts, uids = _build_prompts(samples)
-    capture = _install_tq_capture()
+    capture = _install_tq_capture(uids=uids)
 
     logger.info("Starting %d sample(s), %d session(s) each...", len(samples), n)
     try:
@@ -591,6 +620,8 @@ def run_inference(
                 "tool_image": tool_image,
                 "enable_subagents": enable_subagents,
                 "require_subagent": require_subagent,
+                "disable_log_stats": disable_log_stats,
+                "save_trajectory_messages": save_trajectory_messages,
                 "output_dir": str(Path(output_dir).expanduser().resolve()) if output_dir else None,
             },
             validation_errors=validation_errors,
@@ -632,6 +663,16 @@ def main():
     parser.add_argument("--max-turns", type=int, default=100)
     parser.add_argument("--enable-subagents", action="store_true")
     parser.add_argument(
+        "--disable-log-stats",
+        action="store_true",
+        help="Disable periodic rollout throughput, request, and KV-cache statistics",
+    )
+    parser.add_argument(
+        "--save-trajectory-messages",
+        action="store_true",
+        help="Save normalized message history with each finalized trajectory",
+    )
+    parser.add_argument(
         "--require-subagent",
         action="store_true",
         help="Append a mandatory subagent instruction and fail validation if no multiple-chain session is captured",
@@ -665,6 +706,8 @@ def main():
         enable_subagents=args.enable_subagents,
         require_subagent=args.require_subagent,
         output_dir=args.output_dir,
+        disable_log_stats=args.disable_log_stats,
+        save_trajectory_messages=args.save_trajectory_messages,
     )
 
 

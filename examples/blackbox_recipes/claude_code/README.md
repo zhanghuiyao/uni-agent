@@ -170,7 +170,10 @@ The output directory contains:
 
 - `trajectories.jsonl`: one record per finalized chain, including token IDs,
   response mask, rollout log probabilities, reward, turn count, and final-chain
-  marker.
+  marker. With the default `SAVE_TRAJECTORY_MESSAGES=1`, each record also has
+  an optional top-level `messages` field containing that chain's exact,
+  normalized OpenAI-style message history. This backward-compatible extension
+  keeps `schema_version: 1`.
 - `summary.json`: run configuration, resolve statistics, per-session trajectory
   counts, and structural validation results.
 
@@ -200,6 +203,40 @@ jq -s '
 ' /tmp/uni-agent-claude-subagent/trajectories.jsonl
 ```
 
+Decode the saved token IDs with the exact model/tokenizer used for inference:
+
+```bash
+python examples/blackbox_recipes/claude_code/decode_trajectories.py \
+  --model-path /path/to/model \
+  --input /tmp/uni-agent-claude-subagent/trajectories.jsonl \
+  --output /tmp/uni-agent-claude-subagent/trajectories.decoded.jsonl
+```
+
+The decoder keeps an existing exact `messages` field unchanged and adds
+`decoded_messages`, `decoded_message_parser`, and
+`decoded_message_warnings`. `decoded_messages` is a best-effort reconstruction
+from `prompt_ids + response_ids` using Qwen3.5 ChatML boundaries; it recognizes
+thinking content, function tool calls, and tool responses. The
+[Qwen3.5 chat template](https://huggingface.co/Qwen/Qwen3.5-9B/blob/ef3d031a90d340a92d71f83ec17d054e100ce713/tokenizer_config.json)
+does not encode tool call IDs, so inferred tool calls omit `id`, inferred tool
+messages omit `tool_call_id`, and the decoder emits a warning instead of
+inventing a value. `--skip-special-tokens` only changes the human-readable
+`decoded_prompt`, `decoded_response`, and segment text; structural parsing
+always uses a second decode with special tokens retained.
+
+`messages` is the exact Gateway-side history after the provider adapter has
+normalized the request into OpenAI-style messages. It is not the original
+Anthropic content-block payload. In particular, real tool-call IDs are present
+in this field and can be paired with `tool_call_id`; they cannot be recovered
+reliably from a token-only trajectory.
+
+Message capture is intended for inference/debugging artifacts. It can persist
+the complete prompt, tool output, credentials copied into messages, and base64
+multimodal data. Keep the output directory access-controlled and set
+`SAVE_TRAJECTORY_MESSAGES=0` when this data must not be retained. The generic
+training configuration remains opt-in through
+`actor_rollout_ref.rollout.custom.agent_framework.capture_messages=false`.
+
 The run passes when `multiple_chains_sessions >= 1` and
 `validation.passed == true`. The validator also requires contiguous trajectory
 indexes, exactly one final trajectory per session, aligned response fields,
@@ -220,6 +257,7 @@ the JSONL and summary are written before the process exits nonzero.
 | `ENABLE_SUBAGENTS` | `0` | Allow Claude Code `Agent`/`Task` tools and set `CLAUDE_CODE_FORK_SUBAGENT=1` |
 | `REQUIRE_SUBAGENT` | `0` | Force a subagent in the validation prompt and fail if no multiple-chain session is captured |
 | `OUTPUT_DIR` | `outputs/claude_code_infer` | Inference JSONL and summary output directory |
+| `SAVE_TRAJECTORY_MESSAGES` | `1` | Add each chain's exact normalized Gateway message history to `trajectories.jsonl`; set to `0` for token-only artifacts |
 
 `AGENT_MAX_TURNS` is the only knob that bounds the agent. The trainer's
 `multi_turn.max_assistant_turns` is not enforced on the blackbox rollout path

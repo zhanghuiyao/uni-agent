@@ -30,6 +30,8 @@ NNODES="${NNODES:-1}"
 N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-8}"
 GATEWAY_COUNT="${GATEWAY_COUNT:-1}"
 MAX_CONCURRENT_SESSIONS="${MAX_CONCURRENT_SESSIONS:-8}"
+# 0 keeps periodic rollout throughput, request, and KV-cache statistics enabled.
+DISABLE_LOG_STATS="${DISABLE_LOG_STATS:-0}"
 
 # ── Agent parameters ─────────────────────────────────────────────────────
 AGENT_MAX_TURNS="${AGENT_MAX_TURNS:-100}"
@@ -38,6 +40,7 @@ SWE_AGENT_RUN_TIMEOUT="${SWE_AGENT_RUN_TIMEOUT:-7200}"
 ENABLE_SUBAGENTS="${ENABLE_SUBAGENTS:-0}"
 REQUIRE_SUBAGENT="${REQUIRE_SUBAGENT:-0}"
 OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/outputs/claude_code_infer}"
+SAVE_TRAJECTORY_MESSAGES="${SAVE_TRAJECTORY_MESSAGES:-1}"
 
 # ── AKernel (remote sandbox) ─────────────────────────────────────────────
 export AKERNEL_SERVER_ADDRESS="${AKERNEL_SERVER_ADDRESS:-}"
@@ -58,8 +61,10 @@ echo "Max samples: ${MAX_SAMPLES}"
 echo "Engine:      ${ENGINE} (TP=${TP})"
 echo "Tool image:  ${CLAUDE_CODE_TOOL_IMAGE}"
 echo "Batch:       n=${N}, gateway=${GATEWAY_COUNT}, max_sessions=${MAX_CONCURRENT_SESSIONS}"
+echo "Log stats:   disable_log_stats=${DISABLE_LOG_STATS}"
 echo "Subagents:   enabled=${ENABLE_SUBAGENTS}, required=${REQUIRE_SUBAGENT}"
 echo "Artifacts:   ${OUTPUT_DIR}"
+echo "Messages:    save_trajectory_messages=${SAVE_TRAJECTORY_MESSAGES}"
 echo "====================================="
 
 EXTRA_ARGS=()
@@ -68,6 +73,12 @@ if [[ "${ENABLE_SUBAGENTS}" == "1" ]]; then
 fi
 if [[ "${REQUIRE_SUBAGENT}" == "1" ]]; then
     EXTRA_ARGS+=(--require-subagent)
+fi
+if [[ "${DISABLE_LOG_STATS}" == "1" ]]; then
+    EXTRA_ARGS+=(--disable-log-stats)
+fi
+if [[ "${SAVE_TRAJECTORY_MESSAGES}" == "1" ]]; then
+    EXTRA_ARGS+=(--save-trajectory-messages)
 fi
 
 python -c "import httpx, ray, torch" >/dev/null
@@ -91,4 +102,4 @@ python examples/blackbox_recipes/claude_code/parallel_infer.py \
     --run-timeout "${SWE_AGENT_RUN_TIMEOUT}" \
     --max-turns "${AGENT_MAX_TURNS}" \
     --output-dir "${OUTPUT_DIR}" \
-    "${EXTRA_ARGS[@]}"
+    ${EXTRA_ARGS[@]+"${EXTRA_ARGS[@]}"}

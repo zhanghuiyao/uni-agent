@@ -106,16 +106,17 @@ async def _build_framework_with_agent_runners(
 
 
 @pytest.mark.parametrize(
-    ("data_config", "expected_chat_template_kwargs"),
+    ("data_config", "expected_chat_template_kwargs", "capture_messages"),
     [
-        ({}, {}),
-        ({"apply_chat_template_kwargs": {"thinking": True}}, {"thinking": True}),
+        ({}, {}, False),
+        ({"apply_chat_template_kwargs": {"thinking": True}}, {"thinking": True}, True),
     ],
 )
 def test_build_gateway_manager_wires_gateway_config_defaults(
     monkeypatch,
     data_config,
     expected_chat_template_kwargs,
+    capture_messages,
 ):
     from omegaconf import OmegaConf
 
@@ -146,7 +147,12 @@ def test_build_gateway_manager_wires_gateway_config_defaults(
                     "prompt_length": 128,
                     "response_length": 64,
                     "multi_turn": {"format": "hermes"},
-                    "custom": {"agent_framework": {"gateway_count": 2}},
+                    "custom": {
+                        "agent_framework": {
+                            "gateway_count": 2,
+                            "capture_messages": capture_messages,
+                        }
+                    },
                 },
             },
         }
@@ -160,6 +166,7 @@ def test_build_gateway_manager_wires_gateway_config_defaults(
     assert captured["gateway_actor_config"].prompt_length == 128
     assert captured["gateway_actor_config"].response_length == 64
     assert captured["gateway_actor_config"].tool_parser_name == "hermes"
+    assert captured["gateway_actor_config"].capture_messages is capture_messages
     assert isinstance(captured["gateway_actor_config"].apply_chat_template_kwargs, dict)
     assert captured["gateway_actor_config"].apply_chat_template_kwargs == expected_chat_template_kwargs
 
@@ -261,6 +268,7 @@ def _trajectory(
     reward_info: dict[str, object] | None = None,
     num_turns: int = 2,
     extra_fields: dict[str, object] | None = None,
+    messages: list[dict[str, object]] | None = None,
 ):
     prompt_ids = prompt_ids or [10, 11]
     response_ids = response_ids or [20, 21]
@@ -274,6 +282,7 @@ def _trajectory(
         num_turns=num_turns,
         multi_modal_data={"images": ["raw-image-should-not-be-written"]},
         extra_fields=dict(extra_fields or {}),
+        messages=messages,
     )
 
 
@@ -410,7 +419,14 @@ async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch,
             "session-0-0": [
                 _trajectory(
                     response_logprobs=[-0.1, -0.2],
-                    extra_fields={"materialization_reason": "max_response_length"},
+                    extra_fields={
+                        "materialization_reason": "max_response_length",
+                        "messages": [{"role": "user", "content": "must not override"}],
+                    },
+                    messages=[
+                        {"role": "user", "content": "inspect"},
+                        {"role": "assistant", "content": "done"},
+                    ],
                 )
             ],
             "session-0-1": [_trajectory(response_logprobs=[-0.3, -0.4])],
@@ -484,6 +500,12 @@ async def test_generate_sequences_writes_tq_schema_for_each_session(monkeypatch,
     assert tu.get(fields, "extra_info") == [{"index": 0}]
     assert tu.get(fields, "tools_kwargs") == [{"tool": 0}]
     assert tu.get(fields, "agent_name") == ["deepeyes"]
+    assert tu.get(fields, "messages") == [
+        [
+            {"role": "user", "content": "inspect"},
+            {"role": "assistant", "content": "done"},
+        ]
+    ]
     assert tu.get(fields, "session_id") == [0]
     assert tu.get(fields, "global_steps") == [7]
     assert fields["num_turns"].tolist() == [2]
