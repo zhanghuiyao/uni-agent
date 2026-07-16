@@ -4,6 +4,7 @@
 #
 # Usage:
 #   bash examples/blackbox_recipes/mini_swe_agent/run_infer.sh
+#   SAMPLE_SPLIT="100:200" OUTPUT_DIR=/tmp/infer bash examples/blackbox_recipes/mini_swe_agent/run_infer.sh
 #
 # All configurable via environment variables (see defaults below).
 
@@ -19,8 +20,10 @@ DATA_PATH="${DATA_PATH:-${HOME}/data/swe_agent/swe_bench_verified.parquet}"
 
 # ── Inference parameters ─────────────────────────────────────────────────
 MAX_SAMPLES="${MAX_SAMPLES:--1}"
+SAMPLE_SPLIT="${SAMPLE_SPLIT:-}"
 PROMPT_LENGTH="${PROMPT_LENGTH:-4096}"
 RESPONSE_LENGTH="${RESPONSE_LENGTH:-131072}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-$((PROMPT_LENGTH + RESPONSE_LENGTH + 1024))}"
 TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-1.0}"
 N="${N:-1}"
@@ -35,6 +38,7 @@ MAX_CONCURRENT_SESSIONS="${MAX_CONCURRENT_SESSIONS:-8}"
 AGENT_MAX_TURNS="${AGENT_MAX_TURNS:-100}"
 SWE_AGENT_TOOL_IMAGE="${SWE_AGENT_TOOL_IMAGE:-swr.cn-east-3.myhuaweicloud.com/openyuanrong/mini-swe-agent-tool:latest}"
 SWE_AGENT_RUN_TIMEOUT="${SWE_AGENT_RUN_TIMEOUT:-7200}"
+OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/outputs/mini_swe_agent_infer}"
 
 # ── AKernel (remote sandbox) ─────────────────────────────────────────────
 export AKERNEL_SERVER_ADDRESS="${AKERNEL_SERVER_ADDRESS:-}"
@@ -52,10 +56,15 @@ echo "=== Mini-SWE-Agent Blackbox Inference ==="
 echo "Model:       ${MODEL_PATH}"
 echo "Data:        ${DATA_PATH}"
 echo "Max samples: ${MAX_SAMPLES}"
+if [[ -n "${SAMPLE_SPLIT}" ]]; then
+    echo "Sample split: ${SAMPLE_SPLIT} (overrides max samples)"
+fi
+echo "Max batch tokens: ${MAX_NUM_BATCHED_TOKENS}"
 echo "Engine:      ${ENGINE} (TP=${TP})"
 echo "Tool image:  ${SWE_AGENT_TOOL_IMAGE}"
 echo "Batch:       n=${N}, gateway=${GATEWAY_COUNT}, max_sessions=${MAX_CONCURRENT_SESSIONS}"
-if [[ -n "${GATEWAY_MESSAGE_JSONL_PATH}" ]]; then
+echo "Output:      ${OUTPUT_DIR}"
+if [[ -n "${GATEWAY_MESSAGE_JSONL_PATH:-}" ]]; then
     echo "Messages:    ${GATEWAY_MESSAGE_JSONL_PATH}"
 fi
 echo "========================================="
@@ -64,8 +73,10 @@ python examples/blackbox_recipes/mini_swe_agent/parallel_infer.py \
     --model-path "${MODEL_PATH}" \
     --data-path "${DATA_PATH}" \
     --max-samples "${MAX_SAMPLES}" \
+    --sample-split "${SAMPLE_SPLIT}" \
     --prompt-length "${PROMPT_LENGTH}" \
     --response-length "${RESPONSE_LENGTH}" \
+    --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
     --temperature "${TEMPERATURE}" \
     --top-p "${TOP_P}" \
     --n "${N}" \
@@ -77,4 +88,5 @@ python examples/blackbox_recipes/mini_swe_agent/parallel_infer.py \
     --max-concurrent-sessions "${MAX_CONCURRENT_SESSIONS}" \
     --tool-image "${SWE_AGENT_TOOL_IMAGE}" \
     --run-timeout "${SWE_AGENT_RUN_TIMEOUT}" \
-    --max-turns "${AGENT_MAX_TURNS}"
+    --max-turns "${AGENT_MAX_TURNS}" \
+    --output-dir "${OUTPUT_DIR}"
