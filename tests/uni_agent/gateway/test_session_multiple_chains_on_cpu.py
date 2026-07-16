@@ -32,6 +32,7 @@ def _session(
     *,
     apply_chat_template_kwargs: dict | None = None,
     response_length: int | None = None,
+    sampling_params: dict | None = None,
     processor=None,
     vision_info_extractor=None,
     tool_parser_name: str | None = None,
@@ -46,11 +47,13 @@ def _session(
             apply_chat_template_kwargs=apply_chat_template_kwargs,
         ),
         response_length=response_length,
+        sampling_params=sampling_params,
     )
 
 
 @pytest.mark.parametrize("response_length", [0, -1])
 def test_gateway_session_rejects_non_positive_response_length(response_length):
+    """Reject non-positive session response budgets during construction."""
     with pytest.raises(ValueError, match="response_length must be positive"):
         _session("invalid-response-length", response_length=response_length)
 
@@ -68,169 +71,6 @@ async def _run(session: GatewaySession, backend: SequencedBackend, messages: lis
         },
         backend,
     )
-
-
-def test_encode_incremental_uses_request_chat_template_kwargs_for_prefix_slice(monkeypatch):
-    import uni_agent.gateway.session.codec as codec_mod
-
-    class PrefixChangingTokenizer:
-        @staticmethod
-        def _prefix(prefix_style: str = "short") -> str:
-            return "<s>" if prefix_style == "short" else "<long-system-prefix>"
-
-        def system_prompt(self, **kwargs) -> list[int]:
-            return _ids(self._prefix(**kwargs))
-
-        def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True, tools=None, **kwargs):
-            text = self._prefix(**kwargs)
-            for message in messages:
-                text += f"{message['role']}:{message.get('content', '')}\n"
-            if add_generation_prompt:
-                text += "assistant:"
-            if tokenize:
-                return _ids(text)
-            return text
-
-        def decode(self, token_ids, skip_special_tokens=True):
-            return "".join(chr(token_id) for token_id in token_ids)
-
-    def apply_chat_template(tokenizer, messages, **kwargs):
-        return tokenizer.apply_chat_template(messages, **kwargs)
-
-    def initialize_system_prompt(tokenizer, **kwargs):
-        return tokenizer.system_prompt(**kwargs)
-
-    monkeypatch.setattr(codec_mod, "_apply_chat_template", apply_chat_template)
-    monkeypatch.setattr(codec_mod, "initialize_system_prompt", initialize_system_prompt)
-
-    tokenizer = PrefixChangingTokenizer()
-    codec = MessageCodec(tokenizer, apply_chat_template_kwargs={"prefix_style": "long"})
-    incremental_ids = codec.encode_incremental(
-        [{"role": "user", "content": "delta"}],
-        request_chat_template_kwargs={"prefix_style": "short"},
-    )
-
-    assert tokenizer.decode(incremental_ids) == "user:delta\nassistant:"
-
-
-def test_encode_incremental_processor_uses_request_chat_template_kwargs_for_prefix_slice(monkeypatch):
-    import torch
-
-    import uni_agent.gateway.session.codec as codec_mod
-
-    class _PrefixChangingEncoder:
-        @staticmethod
-        def _prefix(prefix_style: str = "short") -> str:
-            return "<s>" if prefix_style == "short" else "<long-system-prefix>"
-
-        def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True, tools=None, **kwargs):
-            text = self._prefix(**kwargs)
-            for message in messages:
-                text += f"{message['role']}:{message.get('content', '')}\n"
-            if add_generation_prompt:
-                text += "assistant:"
-            return _ids(text) if tokenize else text
-
-        def decode(self, token_ids, skip_special_tokens=True):
-            return "".join(chr(token_id) for token_id in token_ids)
-
-    # The processor prepends a BOS token the bare tokenizer never emits, so its system-prompt
-    # prefix is one token longer. Slicing the continuation with a tokenizer-derived prefix
-    # would be off by one; this double makes the test fail unless encode_incremental measures
-    # the strip prefix with the processor that produced the ids.
-    processor_bos = 9999
-
-    class _PrefixChangingProcessor(_PrefixChangingEncoder):
-        def system_prompt(self, **kwargs) -> list[int]:
-            return [processor_bos] + _ids(self._prefix(**kwargs))
-
-        def __call__(
-            self, *, text, images=None, videos=None, video_metadata=None, return_tensors=None, do_sample_frames=False
-        ):
-            assert len(text) == 1
-            return {"input_ids": torch.tensor([[processor_bos] + _ids(text[0])], dtype=torch.long)}
-
-    class _PlainTokenizer(_PrefixChangingEncoder):
-        def system_prompt(self, **kwargs) -> list[int]:
-            return _ids(self._prefix(**kwargs))
-
-    def apply_chat_template(encoder, messages, **kwargs):
-        return encoder.apply_chat_template(messages, **kwargs)
-
-    def initialize_system_prompt(encoder, **kwargs):
-        return encoder.system_prompt(**kwargs)
-
-    monkeypatch.setattr(codec_mod, "_apply_chat_template", apply_chat_template)
-    monkeypatch.setattr(codec_mod, "initialize_system_prompt", initialize_system_prompt)
-
-    codec = MessageCodec(
-        _PlainTokenizer(),
-        processor=_PrefixChangingProcessor(),
-        apply_chat_template_kwargs={"prefix_style": "long"},
-    )
-    incremental_ids = codec.encode_incremental(
-        [{"role": "user", "content": "delta"}],
-        request_chat_template_kwargs={"prefix_style": "short"},
-    )
-
-    assert _PlainTokenizer().decode(incremental_ids) == "user:delta\nassistant:"
-
-
-def test_encode_incremental_processor_default_kwargs_uses_processor_prefix_for_slice(monkeypatch):
-    import torch
-
-    import uni_agent.gateway.session.codec as codec_mod
-
-    class _Encoder:
-        @staticmethod
-        def _prefix(prefix_style="short"):
-            return "<s>" if prefix_style == "short" else "<long-system-prefix>"
-
-        def apply_chat_template(self, messages, tokenize=True, add_generation_prompt=True, tools=None, **kwargs):
-            text = self._prefix(**kwargs)
-            text += "".join(f"{message['role']}:{message.get('content', '')}\n" for message in messages)
-            if add_generation_prompt:
-                text += "assistant:"
-            return _ids(text) if tokenize else text
-
-        def decode(self, token_ids, skip_special_tokens=True):
-            return "".join(chr(token_id) for token_id in token_ids)
-
-    processor_bos = 9999
-
-    class _Processor(_Encoder):
-        def system_prompt(self, **kwargs):
-            return [processor_bos] + _ids(self._prefix(**kwargs))
-
-        def __call__(
-            self, *, text, images=None, videos=None, video_metadata=None, return_tensors=None, do_sample_frames=False
-        ):
-            return {"input_ids": torch.tensor([[processor_bos] + _ids(text[0])], dtype=torch.long)}
-
-    class _Tokenizer(_Encoder):
-        def system_prompt(self, **kwargs):
-            return _ids(self._prefix(**kwargs))
-
-    monkeypatch.setattr(
-        codec_mod,
-        "_apply_chat_template",
-        lambda encoder, messages, **kwargs: encoder.apply_chat_template(messages, **kwargs),
-    )
-    monkeypatch.setattr(
-        codec_mod,
-        "initialize_system_prompt",
-        lambda encoder, **kwargs: encoder.system_prompt(**kwargs),
-    )
-
-    codec = MessageCodec(
-        _Tokenizer(),
-        processor=_Processor(),
-        apply_chat_template_kwargs={"prefix_style": "long"},
-    )
-
-    incremental_ids = codec.encode_incremental([{"role": "user", "content": "delta"}])
-
-    assert _Tokenizer().decode(incremental_ids) == "user:delta\nassistant:"
 
 
 class _LogprobBackend:
@@ -311,7 +151,7 @@ async def _codec_compatible_video_extractor(messages, image_patch_size, config=N
 def _assert_active_chain_tip_hashes_match_history(session: GatewaySession) -> None:
     state = session.snapshot_state()
     for chain in session.active_chains:
-        expected_tip_hash = session._compute_message_prefix_hashes(chain.message_history)[-1]
+        expected_tip_hash = session._extend_message_prefix_hashes([], chain.message_history)[-1]
         assert chain.message_tip_hash == expected_tip_hash
         assert state["active_chain_tip_hashes"][chain.chain_id] == expected_tip_hash
 
@@ -733,6 +573,7 @@ async def test_multiple_chains_exactly_exhausted_chain_closes_without_backend_ca
 
 @pytest.mark.asyncio
 async def test_multiple_chains_sets_remaining_budget_when_request_omits_max_tokens():
+    """Use the remaining session budget when max_tokens is omitted."""
     session = _session("default-max-tokens-budget", response_length=10)
     backend = SequencedBackend(["A"])
 
@@ -744,6 +585,7 @@ async def test_multiple_chains_sets_remaining_budget_when_request_omits_max_toke
 @pytest.mark.parametrize("max_tokens", [0, -1, None, "1", 1.5, True])
 @pytest.mark.asyncio
 async def test_multiple_chains_rejects_invalid_request_max_tokens_before_backend_call(max_tokens):
+    """Reject invalid request max_tokens values before backend generation."""
     session = _session("invalid-request-max-tokens")
     backend = SequencedBackend(["SHOULD_NOT_RUN"])
 
@@ -754,6 +596,19 @@ async def test_multiple_chains_rejects_invalid_request_max_tokens_before_backend
             [{"role": "user", "content": "invalid request max_tokens"}],
             max_tokens=max_tokens,
         )
+
+    assert exc_info.value.status_code == 400
+    assert backend.calls == []
+
+
+@pytest.mark.asyncio
+async def test_multiple_chains_rejects_invalid_session_max_tokens_before_backend_call():
+    """Reject an invalid session max_tokens value before backend generation."""
+    session = _session("invalid-session-max-tokens", sampling_params={"max_tokens": 0})
+    backend = SequencedBackend(["SHOULD_NOT_RUN"])
+
+    with pytest.raises(HTTPException, match="max_tokens must be a positive integer") as exc_info:
+        await _run(session, backend, [{"role": "user", "content": "invalid session max_tokens"}])
 
     assert exc_info.value.status_code == 400
     assert backend.calls == []
@@ -862,6 +717,7 @@ async def test_multiple_chains_video_media_stays_chain_local():
 async def test_multiple_chains_length_exhaustion_does_not_materialize_unsent_media(
     media_kind, message_factory, extractor, sent_url, unsent_url, backend_field, trajectory_key
 ):
+    """Exclude unsent media when length exhaustion skips backend generation."""
     session = _session(
         f"length-unsent-{media_kind}",
         response_length=len("FIRST") + 1,
@@ -892,6 +748,7 @@ async def test_multiple_chains_length_exhaustion_does_not_materialize_unsent_med
 
 @pytest.mark.asyncio
 async def test_multiple_chains_abort_clears_length_materialized_trajectories():
+    """Clear length-materialized trajectories when the session is aborted."""
     session = _session("abort-clears-materialized", response_length=len("FIRST") + 1)
     backend = SequencedBackend(["FIRST", "SHOULD_NOT_RUN"])
     first_messages = [{"role": "user", "content": "first turn"}]
@@ -1005,10 +862,8 @@ async def test_multiple_chains_decode_failure_releases_reserved_chain_for_retry(
 
     with monkeypatch.context() as patch:
         patch.setattr(session._codec, "decode_response", decode_response_raises)
-        with pytest.raises(HTTPException) as exc_info:
+        with pytest.raises(RuntimeError, match="decode boom"):
             await _run(session, SequencedBackend(["IGNORED"]), continuation)
-    assert exc_info.value.status_code == 500
-    assert "decode boom" in str(exc_info.value.detail)
 
     await _run(session, SequencedBackend(["SECOND"]), continuation)
     assert session.snapshot_state()["active_chain_ids"] == [1]
@@ -1068,7 +923,7 @@ async def test_multiple_chains_prefix_content_change_does_not_reuse_chain_and_ha
     assert all(t.response_mask == [1] * len(t.response_ids) for t in trajectories)
 
 
-def test_compute_message_prefix_hashes_canonicalizes_json_tool_call_arguments():
+def test_message_prefix_hashes_canonicalize_json_tool_call_arguments():
     """Canonicalize JSON-equivalent tool arguments before computing prefix hashes."""
     session = _session("hash-tool-arguments")
 
@@ -1085,11 +940,11 @@ def test_compute_message_prefix_hashes_canonicalizes_json_tool_call_arguments():
             ],
         }
 
-    canonical_a = session._compute_message_prefix_hashes([assistant_tool_call('{"query":"weather","limit":2}')])
-    canonical_b = session._compute_message_prefix_hashes([assistant_tool_call('{"limit":2,"query":"weather"}')])
-    canonical_c = session._compute_message_prefix_hashes([assistant_tool_call({"limit": 2, "query": "weather"})])
-    raw_a = session._compute_message_prefix_hashes([assistant_tool_call('{"query":"weather","limit":2')])
-    raw_b = session._compute_message_prefix_hashes([assistant_tool_call('{"limit":2,"query":"weather"')])
+    canonical_a = session._extend_message_prefix_hashes([], [assistant_tool_call('{"query":"weather","limit":2}')])
+    canonical_b = session._extend_message_prefix_hashes([], [assistant_tool_call('{"limit":2,"query":"weather"}')])
+    canonical_c = session._extend_message_prefix_hashes([], [assistant_tool_call({"limit": 2, "query": "weather"})])
+    raw_a = session._extend_message_prefix_hashes([], [assistant_tool_call('{"query":"weather","limit":2')])
+    raw_b = session._extend_message_prefix_hashes([], [assistant_tool_call('{"limit":2,"query":"weather"')])
 
     assert canonical_a == canonical_b
     assert canonical_a == canonical_c

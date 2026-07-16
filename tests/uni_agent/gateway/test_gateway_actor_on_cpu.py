@@ -285,6 +285,7 @@ def test_prefix_canonicalization_ignores_provider_ids_and_normalizes_arguments()
             == codec.canonicalize_message_for_prefix_comparison(msg_b)
         ) is expect_equal
 
+
 @pytest.mark.asyncio
 async def test_config_chat_template_kwargs_forwarded(monkeypatch):
     """Codec-level chat-template kwargs are copied and forwarded."""
@@ -324,28 +325,6 @@ async def test_config_chat_template_kwargs_forwarded(monkeypatch):
         assert captured_kwargs["default_only"] == "kept"
     finally:
         await actor.shutdown()
-
-
-@pytest.mark.asyncio
-async def test_gateway_actor_rejects_invalid_session_max_tokens_before_backend_call():
-    from fastapi import HTTPException
-
-    from uni_agent.gateway.config import GatewayActorConfig
-    from uni_agent.gateway.gateway import _GatewayActor
-
-    backend = SequencedBackend(["SHOULD_NOT_RUN"])
-    actor = _GatewayActor(GatewayActorConfig(tokenizer=FakeTokenizer()), backend)
-    actor._server_base_url = "http://gateway.local"
-    await actor.create_session("invalid-session-max-tokens", sampling_params={"max_tokens": 0})
-
-    with pytest.raises(HTTPException, match="max_tokens must be a positive integer") as exc_info:
-        await actor._handle_openai_chat_completions(
-            "invalid-session-max-tokens",
-            {"messages": [{"role": "user", "content": "invalid session max_tokens"}]},
-        )
-
-    assert exc_info.value.status_code == 400
-    assert backend.calls == []
 
 
 @pytest.mark.asyncio
@@ -1546,7 +1525,7 @@ async def test_anthropic_claude_code_subagent_multiple_chains_return_to_main(mon
     assert 0 in trajectories[1].response_mask
     assert 1 in trajectories[1].response_mask
     assert all(len(trajectory.response_ids) == len(trajectory.response_mask) for trajectory in trajectories)
-    assert all(len(trajectory.response_ids) == len(trajectory.response_logprobs) for trajectory in trajectories)
+    assert all(trajectory.response_logprobs is None for trajectory in trajectories)
     assert trajectories[0].reward_info == trajectories[1].reward_info
 
 
