@@ -206,10 +206,8 @@ class MessageCodec:
         tools: list[dict[str, Any]] | None = None,
         image_data: list[Any] | None = None,
         video_data: list[Any] | None = None,
-        request_chat_template_kwargs: dict[str, Any] | None = None,
     ) -> list[int]:
         """Encode a full chat history into prompt token IDs."""
-        chat_template_kwargs = self.effective_chat_template_kwargs(request_chat_template_kwargs)
         if self._processor is not None:
             raw_prompt = _apply_chat_template(
                 self._processor,
@@ -217,7 +215,7 @@ class MessageCodec:
                 tools=tools,
                 add_generation_prompt=True,
                 tokenize=False,
-                **chat_template_kwargs,
+                **self._apply_chat_template_kwargs,
             )
             videos = video_data
             video_metadata = None
@@ -240,7 +238,7 @@ class MessageCodec:
                 messages,
                 tools=tools,
                 add_generation_prompt=True,
-                **chat_template_kwargs,
+                **self._apply_chat_template_kwargs,
             )
         )
 
@@ -250,17 +248,15 @@ class MessageCodec:
         messages: list[dict[str, Any]],
         image_data: list[Any] | None = None,
         video_data: list[Any] | None = None,
-        request_chat_template_kwargs: dict[str, Any] | None = None,
     ) -> list[int]:
         """Encode continuation messages without the cached system prompt prefix."""
-        chat_template_kwargs = self.effective_chat_template_kwargs(request_chat_template_kwargs)
         if self._processor is not None:
             raw_prompt = _apply_chat_template(
                 self._processor,
                 messages,
                 add_generation_prompt=True,
                 tokenize=False,
-                **chat_template_kwargs,
+                **self._apply_chat_template_kwargs,
             )
             videos = video_data
             video_metadata = None
@@ -282,21 +278,10 @@ class MessageCodec:
                     self._tokenizer,
                     messages,
                     add_generation_prompt=True,
-                    **chat_template_kwargs,
+                    **self._apply_chat_template_kwargs,
                 )
             )
-        system_prompt = self._system_prompt
-        if chat_template_kwargs != self._apply_chat_template_kwargs:
-            prefix_encoder = self._processor if self._processor is not None else self._tokenizer
-            system_prompt = initialize_system_prompt(prefix_encoder, **chat_template_kwargs)
-        return ids[len(system_prompt) :]
-
-    def effective_chat_template_kwargs(
-        self,
-        request_chat_template_kwargs: dict[str, Any] | None = None,
-    ) -> dict[str, Any]:
-        """Merge codec defaults with per-request chat-template overrides."""
-        return {**self._apply_chat_template_kwargs, **(request_chat_template_kwargs or {})}
+        return ids[len(self._system_prompt) :]
 
     async def decode_response(
         self,
@@ -336,16 +321,16 @@ class MessageCodec:
     def canonicalize_message_for_prefix_comparison(self, message: dict[str, Any]) -> dict[str, Any]:
         """Canonicalize one message before session prefix comparison."""
         normalized = dict(message)
-        # Tool-result correlation ids are wire noise; prefix comparison ignores
-        # them while preserving unexpected top-level fields on other roles.
-        if normalized.get("role") == "tool":
-            normalized.pop("tool_call_id", None)
+        normalized.pop("tool_call_id", None)
         tool_calls = normalized.get("tool_calls")
         if not isinstance(tool_calls, list):
             return normalized
 
-        normalized_tool_calls: list[dict[str, Any]] = []
+        normalized_tool_calls: list[Any] = []
         for tool_call in tool_calls:
+            if not isinstance(tool_call, dict):
+                normalized_tool_calls.append(tool_call)
+                continue
             normalized_tool_call = dict(tool_call)
             normalized_tool_call.pop("id", None)
             function = normalized_tool_call.get("function")

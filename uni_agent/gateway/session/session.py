@@ -60,7 +60,6 @@ class ChainState:
     message_history: list[dict[str, Any]]
     message_tip_hash: str
     active_tool_schemas: list[dict[str, Any]] | None
-    effective_chat_template_kwargs: dict[str, Any]
     buffer: TrajectoryBuffer
     image_data: list[Any] | None
     video_data: list[Any] | None
@@ -96,8 +95,6 @@ class EncodedData:
             early return, or ``None`` on the normal path.
         chain_id: Selected active chain id, or ``None`` when commit should append
             a new chain.
-        effective_chat_template_kwargs: Effective chat-template kwargs used for
-            chain compatibility and encoding.
         incoming_message_prefix_hashes: Stable prefix hashes for the normalized
             request history.
     """
@@ -111,7 +108,6 @@ class EncodedData:
     video_data: list[Any] | None
     length_exhausted_trajectory: Trajectory | None
     chain_id: int | None
-    effective_chat_template_kwargs: dict[str, Any] = field(default_factory=dict)
     incoming_message_prefix_hashes: list[str] = field(default_factory=list)
 
 
@@ -334,8 +330,6 @@ class GatewaySession:
     async def _prepare_generation_inputs(self, request: InternalGenerationRequest) -> EncodedData:
         messages = request["messages"]
         tools = request["tools"]
-        request_chat_template_kwargs = request["chat_template_kwargs"]
-        effective_chat_template_kwargs = self._codec.effective_chat_template_kwargs(request_chat_template_kwargs)
         sampling_params = dict(self._sampling_params)
         sampling_params.update(request["sampling_params"])
         if "max_tokens" in sampling_params:
@@ -345,7 +339,6 @@ class GatewaySession:
         incoming_message_prefix_hashes = self._extend_message_prefix_hashes([], messages)
         selected_chain = self._select_chain(
             tools=tools,
-            effective_chat_template_kwargs=effective_chat_template_kwargs,
             incoming_message_prefix_hashes=incoming_message_prefix_hashes,
         )
 
@@ -356,7 +349,6 @@ class GatewaySession:
                 tools=tools,
                 image_data=image_data,
                 video_data=video_data,
-                request_chat_template_kwargs=request_chat_template_kwargs,
             )
             buffer = TrajectoryBuffer(prompt_ids=prompt_ids)
             chain_id = None
@@ -368,16 +360,16 @@ class GatewaySession:
             new_image_data = None
             new_video_data = None
             incremental_ids = []
-            if incremental_messages:
+            already_exhausted = self._response_length is not None and len(buffer.response_mask) >= self._response_length
+            if incremental_messages and not already_exhausted:
                 new_image_data, new_video_data = await self._codec.extract_multi_modal_data(incremental_messages)
                 incremental_ids = self._codec.encode_incremental(
                     incremental_messages,
                     image_data=new_image_data,
                     video_data=new_video_data,
-                    request_chat_template_kwargs=request_chat_template_kwargs,
                 )
 
-            if (
+            if already_exhausted or (
                 self._response_length is not None
                 and len(buffer.response_mask) + len(incremental_ids) >= self._response_length
             ):
@@ -395,7 +387,6 @@ class GatewaySession:
                         extra_fields={"materialization_reason": "max_response_length"},
                     ),
                     chain_id=selected_chain.chain_id,
-                    effective_chat_template_kwargs=effective_chat_template_kwargs,
                     incoming_message_prefix_hashes=list(incoming_message_prefix_hashes),
                 )
 
@@ -431,7 +422,6 @@ class GatewaySession:
             video_data=video_data,
             length_exhausted_trajectory=None,
             chain_id=chain_id,
-            effective_chat_template_kwargs=effective_chat_template_kwargs,
             incoming_message_prefix_hashes=list(incoming_message_prefix_hashes),
         )
 
@@ -439,7 +429,6 @@ class GatewaySession:
         self,
         *,
         tools: list[dict[str, Any]] | None,
-        effective_chat_template_kwargs: dict[str, Any],
         incoming_message_prefix_hashes: list[str],
     ) -> ChainState | None:
         candidates = [
@@ -447,7 +436,6 @@ class GatewaySession:
             for chain in self.active_chains
             if chain.chain_id not in self.reserved_chain_ids
             and chain.active_tool_schemas == tools
-            and chain.effective_chat_template_kwargs == effective_chat_template_kwargs
             and self._is_chain_prefix_hash_match(
                 chain=chain,
                 incoming_message_prefix_hashes=incoming_message_prefix_hashes,
@@ -530,7 +518,6 @@ class GatewaySession:
                     message_history=message_history,
                     message_tip_hash=message_prefix_hashes[-1],
                     active_tool_schemas=encoded.tools,
-                    effective_chat_template_kwargs=dict(encoded.effective_chat_template_kwargs),
                     buffer=encoded.buffer,
                     image_data=self._copy_media_list(encoded.image_data),
                     video_data=self._copy_media_list(encoded.video_data),
@@ -546,7 +533,6 @@ class GatewaySession:
             message_history=message_history,
             message_tip_hash=message_prefix_hashes[-1],
             active_tool_schemas=encoded.tools,
-            effective_chat_template_kwargs=dict(encoded.effective_chat_template_kwargs),
             buffer=encoded.buffer,
             image_data=self._copy_media_list(encoded.image_data),
             video_data=self._copy_media_list(encoded.video_data),

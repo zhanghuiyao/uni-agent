@@ -125,10 +125,10 @@ async def test_gateway_actor_over_budget_closes_without_backend_call():
 
 @pytest.mark.asyncio
 async def test_gateway_actor_continuation_budget_exhausted_materializes_length_stop():
-    """When a continuation request would push the total response tokens past
-    ``response_length``, the gateway skips the backend call, commits the
-    active trajectory with a max-response-length materialization reason, and returns an
-    empty assistant message without incrementing ``completion_tokens``."""
+    """When a continuation request exceeds the selected chain response budget,
+    the gateway skips the backend call, closes that chain with
+    ``materialization_reason="max_response_length"``, and returns an empty
+    assistant message with ``finish_reason="length"``."""
     from uni_agent.gateway.config import GatewayActorConfig
     from uni_agent.gateway.gateway import _GatewayActor
 
@@ -221,14 +221,15 @@ async def test_unknown_session_raises_404():
 
 
 def test_prefix_canonicalization_ignores_provider_ids_and_normalizes_arguments():
-    """Prefix comparison ignores provider-generated tool ids and normalizes
-    JSON-equivalent tool-call arguments without hiding invalid raw strings."""
+    """Drop provider IDs and normalize arguments without mutating the message."""
     from uni_agent.gateway.session.codec import MessageCodec
 
     codec = MessageCodec(FakeTokenizer())
-    a = {
+    message = {
         "role": "assistant",
         "content": "",
+        "tool_call_id": "call_result",
+        "metadata": {"keep": True},
         "tool_calls": [
             {
                 "id": "call_AAA",
@@ -237,29 +238,22 @@ def test_prefix_canonicalization_ignores_provider_ids_and_normalizes_arguments()
             }
         ],
     }
-    b = {
+    canonical = codec.canonicalize_message_for_prefix_comparison(message)
+
+    assert canonical == {
         "role": "assistant",
         "content": "",
+        "metadata": {"keep": True},
         "tool_calls": [
             {
-                "id": "call_BBB",
                 "type": "function",
-                "function": {"name": "f", "arguments": {"x": 1}},
+                "function": {"name": "f", "arguments": ("json", {"x": 1})},
             }
         ],
     }
-    assert codec.canonicalize_message_for_prefix_comparison(a) == codec.canonicalize_message_for_prefix_comparison(b)
-    tc = codec.canonicalize_message_for_prefix_comparison(a)["tool_calls"][0]
-    assert "id" not in tc
-
-    assert codec.canonicalize_message_for_prefix_comparison(
-        {"role": "tool", "tool_call_id": "call_AAA", "content": "found"}
-    ) == codec.canonicalize_message_for_prefix_comparison(
-        {"role": "tool", "tool_call_id": "call_BBB", "content": "found"}
-    )
-    assert codec.canonicalize_message_for_prefix_comparison(
-        {"role": "assistant", "tool_call_id": "call_AAA", "content": ""}
-    ) == {"role": "assistant", "tool_call_id": "call_AAA", "content": ""}
+    assert message["tool_call_id"] == "call_result"
+    assert message["tool_calls"][0]["id"] == "call_AAA"
+    assert message["tool_calls"][0]["function"]["arguments"] == {"x": 1}
 
     argument_cases = [
         ({"b": 2, "a": 1}, '{"a": 1, "b": 2}', True),
@@ -986,7 +980,9 @@ async def test_gateway_actor_allowlist_filters_sampling_params(ray_runtime, back
 
 
 @pytest.mark.asyncio
-async def test_gateway_actor_session_sampling_defaults_are_isolated_and_request_overridable():
+@pytest.mark.parametrize("provider", ["openai", "anthropic"])
+async def test_gateway_actor_session_sampling_defaults_are_isolated_and_request_overridable(provider):
+    """Both provider handlers apply base, session, then request sampling params."""
     from uni_agent.gateway.config import GatewayActorConfig
     from uni_agent.gateway.gateway import _GatewayActor
 
@@ -1006,6 +1002,7 @@ async def test_gateway_actor_session_sampling_defaults_are_isolated_and_request_
     )
     await actor.start()
     train_sampling_params = {"temperature": 0.4, "top_p": 0.5, "logprobs": True}
+    handler = actor._handle_openai_chat_completions if provider == "openai" else actor._handle_anthropic_messages
     try:
         await actor.create_session("train-session", sampling_params=train_sampling_params)
         train_sampling_params["temperature"] = 9.0
@@ -1014,7 +1011,7 @@ async def test_gateway_actor_session_sampling_defaults_are_isolated_and_request_
             sampling_params={"temperature": 0, "top_p": 0.9, "top_k": -1, "logprobs": False},
         )
 
-        await actor._handle_openai_chat_completions(
+        await handler(
             "train-session",
             {
                 "messages": [{"role": "user", "content": "train"}],
@@ -1022,9 +1019,12 @@ async def test_gateway_actor_session_sampling_defaults_are_isolated_and_request_
                 "max_tokens": 128,
             },
         )
-        await actor._handle_openai_chat_completions(
+        await handler(
             "val-session",
-            {"messages": [{"role": "user", "content": "validate"}]},
+            {
+                "messages": [{"role": "user", "content": "validate"}],
+                "max_tokens": 64,
+            },
         )
     finally:
         await actor.shutdown()
@@ -1343,9 +1343,7 @@ async def test_anthropic_and_openai_produce_identical_trajectory():
 
 @pytest.mark.asyncio
 async def test_anthropic_tool_turn_round_trip_extends_not_reencodes(monkeypatch):
-    """When an Anthropic agent echoes a previous assistant tool_use turn back as
-    history, conversion must reproduce stored normalized message sufficiently for
-    prefix check to pass and extend one trajectory instead of re-encoding a new one."""
+    """A real Anthropic tool_result round trip extends the existing trajectory."""
     import uni_agent.gateway.session.codec as codec_mod
     from uni_agent.gateway.config import GatewayActorConfig
     from uni_agent.gateway.gateway import _GatewayActor
@@ -1371,22 +1369,33 @@ async def test_anthropic_tool_turn_round_trip_extends_not_reencodes(monkeypatch)
             },
         )
         first_body = json.loads(first.body)
-        assert first_body["content"][0]["type"] == "tool_use"
-        echoed = [
-            {"role": "user", "content": "go"},
-            {"role": "assistant", "content": first_body["content"]},
-            {"role": "user", "content": "next"},
-        ]
+        tool_use = first_body["content"][0]
+        assert tool_use["type"] == "tool_use"
         await actor._handle_anthropic_messages(
             "s-rt",
             {
                 "max_tokens": 16,
                 "tools": [{"name": "search", "input_schema": {"type": "object"}}],
-                "messages": echoed,
+                "messages": [
+                    {"role": "user", "content": "go"},
+                    {"role": "assistant", "content": first_body["content"]},
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": tool_use["id"],
+                                "content": "sunny and warm",
+                            }
+                        ],
+                    },
+                ],
             },
         )
         trajectories = await actor.finalize_session("s-rt")
         assert len(trajectories) == 1
+        assert 0 in trajectories[0].response_mask
+        assert 1 in trajectories[0].response_mask
     finally:
         await actor.shutdown()
 
