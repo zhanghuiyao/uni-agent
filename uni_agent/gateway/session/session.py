@@ -6,6 +6,7 @@ import asyncio
 import hashlib
 import json
 import time
+from copy import deepcopy
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Any
@@ -183,6 +184,7 @@ class GatewaySession:
         response_length: int | None = None,
         sampling_params: dict[str, Any] | None = None,
         enable_last_assistant_rollback: bool = True,
+        capture_messages: bool = False,
     ):
         """Create an active session bound to a handle and model codec."""
         if prompt_length is not None and prompt_length <= 0:
@@ -199,6 +201,7 @@ class GatewaySession:
         )
         self._sampling_params = dict(sampling_params or {})
         self._enable_last_assistant_rollback = enable_last_assistant_rollback
+        self._capture_messages = capture_messages
         self.active_chains: list[ChainState] = []
         self.materialized_chains: list[MaterializedChain] = []
         self.reserved_chain_ids: set[int] = set()
@@ -793,6 +796,7 @@ class GatewaySession:
             response_logprobs=response_logprobs,
             reward_info={},
             num_turns=self._count_chat_turns(chain.message_history),
+            messages=deepcopy(chain.message_history) if self._capture_messages else None,
             routed_experts=chain.buffer.routed_experts,
             multi_modal_data=self._build_multi_modal_trajectory_data(
                 chain.image_data,

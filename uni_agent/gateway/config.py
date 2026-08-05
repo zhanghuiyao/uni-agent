@@ -31,6 +31,9 @@ class GatewayActorConfig:
             The gateway enforces their sum when both values are set.
         enable_last_assistant_rollback: Whether latest-assistant rewrites may
             rollback and reuse an existing chain. Enabled by default.
+        capture_messages: Whether materialized trajectories include a deep copy
+            of their normalized message history. Disabled by default so generic
+            training does not retain potentially sensitive message payloads.
     """
 
     tokenizer: Any
@@ -43,6 +46,7 @@ class GatewayActorConfig:
     prompt_length: int | None = None
     response_length: int | None = None
     enable_last_assistant_rollback: bool = True
+    capture_messages: bool = False
 
     def __post_init__(self) -> None:
         if type(self.enable_last_assistant_rollback) is not bool:
@@ -50,6 +54,8 @@ class GatewayActorConfig:
                 "enable_last_assistant_rollback must be a bool, "
                 f"got {type(self.enable_last_assistant_rollback).__name__}"
             )
+        if type(self.capture_messages) is not bool:
+            raise ValueError(f"capture_messages must be a bool, got {type(self.capture_messages).__name__}")
         if self.prompt_length is not None and self.prompt_length <= 0:
             raise ValueError(f"prompt_length must be positive when set, got {self.prompt_length}")
         if self.response_length is not None and self.response_length <= 0:

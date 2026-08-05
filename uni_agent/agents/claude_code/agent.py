@@ -28,8 +28,6 @@ _CC_QUIET_ENV = {
     "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
     "CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS": "1",
     "CLAUDE_CODE_ATTRIBUTION_HEADER": "0",
-    "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
-    "CLAUDE_CODE_FORK_SUBAGENT": "0",
     "CLAUDE_CODE_SKIP_PROMPT_HISTORY": "1",
     "CLAUDE_CODE_DISABLE_TERMINAL_TITLE": "1",
 }
@@ -76,10 +74,10 @@ class ClaudeCodeConfig(AgentConfig):
     name: str = "claude_code"
     max_turns: int | None = Field(default=80, description="--max-turns budget; None to omit.")
     disallowed_tools: list[str] = Field(
-        default_factory=lambda: ["Agent", "Task", "WebFetch", "WebSearch", "AskUserQuestion"],
+        default_factory=lambda: ["WebFetch", "WebSearch", "AskUserQuestion"],
         description=(
-            "--disallowedTools deny-list. Subagent, web, and interactive-user tools are disabled "
-            "to keep each headless rollout self-contained and deterministic."
+            "--disallowedTools deny-list. Web and interactive-user tools are disabled by default "
+            "for unattended headless rollouts."
         ),
     )
     permission_mode: str = Field(
@@ -201,16 +199,13 @@ class ClaudeCodeAgent(Agent):
             # ignores auth, but Claude Code still requires non-empty placeholder values.
             "ANTHROPIC_API_KEY": "" if has_external_api_key else "sk-ant-uni-agent-placeholder",
             "ANTHROPIC_AUTH_TOKEN": configured_api_key if has_external_api_key else str(uuid.uuid4()),
-            # Route every model slot to our single served model. Besides the main tiers,
-            # Claude Code fires *background*/subagent calls (summaries, sub-tasks) on the
-            # haiku + subagent slots. On direct vLLM leaving those unset 404s on a name it
-            # doesn't serve; the gateway ignores the model name, but pinning is harmless
-            # and keeps both paths identical, so pin them all to `model`.
+            # Route every standard model tier to our single served model. On direct vLLM,
+            # leaving these unset can send a model name it does not serve; the gateway
+            # ignores the model name, but pinning keeps both paths identical.
             "ANTHROPIC_MODEL": model,
             "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
             "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
             "ANTHROPIC_DEFAULT_HAIKU_MODEL": model,
-            "CLAUDE_CODE_SUBAGENT_MODEL": model,
             # claude only needs to reach ANTHROPIC_BASE_URL (the gateway node, or a direct
             # vLLM host); it's reachable directly, so strip the sandbox's injected egress proxy.
             "NO_PROXY": "*",

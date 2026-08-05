@@ -25,16 +25,45 @@ TEMPERATURE="${TEMPERATURE:-1.0}"
 TOP_P="${TOP_P:-1.0}"
 N="${N:-1}"
 ENGINE="${ENGINE:-vllm}"
+VLLM_LANGUAGE_MODEL_ONLY="${VLLM_LANGUAGE_MODEL_ONLY:-1}"
+MAX_NUM_BATCHED_TOKENS="${MAX_NUM_BATCHED_TOKENS:-8192}"
 TP="${TP:-4}"
 NNODES="${NNODES:-1}"
 N_GPUS_PER_NODE="${N_GPUS_PER_NODE:-8}"
 GATEWAY_COUNT="${GATEWAY_COUNT:-1}"
 MAX_CONCURRENT_SESSIONS="${MAX_CONCURRENT_SESSIONS:-8}"
 
+if [[ "${MAX_SAMPLES}" != "-1" && ! "${MAX_SAMPLES}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: MAX_SAMPLES must be -1 or a positive integer, got: ${MAX_SAMPLES}" >&2
+    exit 2
+fi
+if [[ "${VLLM_LANGUAGE_MODEL_ONLY}" != "0" && "${VLLM_LANGUAGE_MODEL_ONLY}" != "1" ]]; then
+    echo "ERROR: VLLM_LANGUAGE_MODEL_ONLY must be 0 or 1, got: ${VLLM_LANGUAGE_MODEL_ONLY}" >&2
+    exit 2
+fi
+if ! [[ "${MAX_NUM_BATCHED_TOKENS}" =~ ^[1-9][0-9]*$ ]]; then
+    echo "ERROR: MAX_NUM_BATCHED_TOKENS must be a positive integer, got: ${MAX_NUM_BATCHED_TOKENS}" >&2
+    exit 2
+fi
+if [[ "${VLLM_LANGUAGE_MODEL_ONLY}" == "1" ]]; then
+    VLLM_LANGUAGE_MODEL_ONLY_ARG="--vllm-language-model-only"
+else
+    VLLM_LANGUAGE_MODEL_ONLY_ARG="--no-vllm-language-model-only"
+fi
+
 # ── Agent parameters ─────────────────────────────────────────────────────
 AGENT_MAX_TURNS="${AGENT_MAX_TURNS:-100}"
 CLAUDE_CODE_TOOL_IMAGE="${CLAUDE_CODE_TOOL_IMAGE:-swr.cn-east-3.myhuaweicloud.com/openyuanrong/claude-code-tool:latest}"
 SWE_AGENT_RUN_TIMEOUT="${SWE_AGENT_RUN_TIMEOUT:-7200}"
+
+# ── Artifacts ────────────────────────────────────────────────────────────
+RUN_ID="$(date -u +%Y%m%dT%H%M%SZ)-$$"
+OUTPUT_DIR="${OUTPUT_DIR:-${REPO_ROOT}/outputs/claude_code_infer/${RUN_ID}}"
+SAVE_TRAJECTORY_MESSAGES="${SAVE_TRAJECTORY_MESSAGES:-1}"
+if [[ "${SAVE_TRAJECTORY_MESSAGES}" != "0" && "${SAVE_TRAJECTORY_MESSAGES}" != "1" ]]; then
+    echo "ERROR: SAVE_TRAJECTORY_MESSAGES must be 0 or 1, got: ${SAVE_TRAJECTORY_MESSAGES}" >&2
+    exit 2
+fi
 
 # ── openYuanrong (remote sandbox) ─────────────────────────────────────────────
 export OPENYUANRONG_SERVER_ADDRESS="${OPENYUANRONG_SERVER_ADDRESS:-}"
@@ -52,9 +81,18 @@ echo "=== Claude Code Blackbox Inference ==="
 echo "Model:       ${MODEL_PATH}"
 echo "Data:        ${DATA_PATH}"
 echo "Max samples: ${MAX_SAMPLES}"
+if [[ "${MAX_SAMPLES}" == "-1" ]]; then
+    echo "Sample range: all dataset rows"
+else
+    echo "Sample range: row indices [0, ${MAX_SAMPLES})"
+fi
 echo "Engine:      ${ENGINE} (TP=${TP})"
+echo "Text only:   ${VLLM_LANGUAGE_MODEL_ONLY}"
+echo "Batch tokens: ${MAX_NUM_BATCHED_TOKENS}"
 echo "Tool image:  ${CLAUDE_CODE_TOOL_IMAGE}"
 echo "Batch:       n=${N}, gateway=${GATEWAY_COUNT}, max_sessions=${MAX_CONCURRENT_SESSIONS}"
+echo "Output:      ${OUTPUT_DIR}"
+echo "Messages:    ${SAVE_TRAJECTORY_MESSAGES}"
 echo "====================================="
 
 python examples/blackbox_recipes/claude_code/parallel_infer.py \
@@ -67,6 +105,8 @@ python examples/blackbox_recipes/claude_code/parallel_infer.py \
     --top-p "${TOP_P}" \
     --n "${N}" \
     --engine "${ENGINE}" \
+    "${VLLM_LANGUAGE_MODEL_ONLY_ARG}" \
+    --max-num-batched-tokens "${MAX_NUM_BATCHED_TOKENS}" \
     --tensor-parallel-size "${TP}" \
     --nnodes "${NNODES}" \
     --n-gpus-per-node "${N_GPUS_PER_NODE}" \
@@ -74,4 +114,6 @@ python examples/blackbox_recipes/claude_code/parallel_infer.py \
     --max-concurrent-sessions "${MAX_CONCURRENT_SESSIONS}" \
     --tool-image "${CLAUDE_CODE_TOOL_IMAGE}" \
     --run-timeout "${SWE_AGENT_RUN_TIMEOUT}" \
-    --max-turns "${AGENT_MAX_TURNS}"
+    --max-turns "${AGENT_MAX_TURNS}" \
+    --output-dir "${OUTPUT_DIR}" \
+    --capture-messages "${SAVE_TRAJECTORY_MESSAGES}"

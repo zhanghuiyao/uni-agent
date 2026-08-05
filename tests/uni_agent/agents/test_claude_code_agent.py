@@ -142,14 +142,26 @@ def test_run_uses_sandbox_default_workdir():
     assert "--disable-slash-commands" not in argv
     assert "--dangerously-skip-permissions" not in argv
     disallowed_tools = argv[argv.index("--disallowedTools") + 1].split(",")
-    assert set(disallowed_tools) == {"Agent", "Task", "WebFetch", "WebSearch", "AskUserQuestion"}
+    assert set(disallowed_tools) == {"WebFetch", "WebSearch", "AskUserQuestion"}
     assert sandbox.exec_calls[0]["env"]["ANTHROPIC_BASE_URL"] == "https://ark.example/api/compatible"
     assert sandbox.exec_calls[0]["env"]["ANTHROPIC_API_KEY"] == ""
     assert sandbox.exec_calls[0]["env"]["ANTHROPIC_AUTH_TOKEN"] == "ark-test-api-key"
     assert sandbox.exec_calls[0]["env"]["CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS"] == "1"
     assert sandbox.exec_calls[0]["env"]["CLAUDE_CODE_ATTRIBUTION_HEADER"] == "0"
-    assert sandbox.exec_calls[0]["env"]["CLAUDE_CODE_FORK_SUBAGENT"] == "0"
     assert sandbox.exec_calls[0]["env"]["CLAUDE_CODE_SKIP_PROMPT_HISTORY"] == "1"
+    for key in (
+        "CLAUDE_CODE_FORK_SUBAGENT",
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS",
+        "CLAUDE_CODE_SUBAGENT_MODEL",
+        "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS",
+    ):
+        assert key not in sandbox.exec_calls[0]["env"]
+    for key in (
+        "ANTHROPIC_DEFAULT_OPUS_MODEL",
+        "ANTHROPIC_DEFAULT_SONNET_MODEL",
+        "ANTHROPIC_DEFAULT_HAIKU_MODEL",
+    ):
+        assert sandbox.exec_calls[0]["env"][key] == "policy"
 
 
 def test_run_reports_nonzero_process_exit():
@@ -177,3 +189,20 @@ def test_claude_env_uses_placeholders_for_session_gateway():
     assert env["ANTHROPIC_API_KEY"] == "sk-ant-uni-agent-placeholder"
     assert env["ANTHROPIC_AUTH_TOKEN"]
     assert env["ANTHROPIC_AUTH_TOKEN"] != "EMPTY"
+
+
+def test_claude_env_allows_explicit_subagent_overrides():
+    overrides = {
+        "CLAUDE_CODE_FORK_SUBAGENT": "1",
+        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
+        "CLAUDE_CODE_SUBAGENT_MODEL": "subagent-policy",
+        "CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS": "1",
+    }
+    config = ClaudeCodeConfig(
+        model=ModelConfig(base_url="http://gateway:8000/v1", model_name="policy"),
+        extra_env=overrides,
+    )
+
+    env = ClaudeCodeAgent(config)._claude_env("http://gateway:8000")
+
+    assert {key: env[key] for key in overrides} == overrides

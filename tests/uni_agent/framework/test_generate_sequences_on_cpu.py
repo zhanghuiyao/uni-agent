@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 
 import numpy as np
@@ -122,13 +123,20 @@ async def _build_framework_with_agent_runners(
 
 
 @pytest.mark.parametrize(
-    ("data_config", "rollback_config", "expected_rollback", "expected_chat_template_kwargs"),
+    (
+        "data_config",
+        "framework_config",
+        "expected_rollback",
+        "expected_capture_messages",
+        "expected_chat_template_kwargs",
+    ),
     [
-        ({}, {}, True, {}),
+        ({}, {}, True, False, {}),
         (
             {"apply_chat_template_kwargs": {"thinking": True}},
-            {"enable_last_assistant_rollback": False},
+            {"enable_last_assistant_rollback": False, "capture_messages": True},
             False,
+            True,
             {"thinking": True},
         ),
     ],
@@ -136,8 +144,9 @@ async def _build_framework_with_agent_runners(
 def test_build_gateway_manager_wires_gateway_config_defaults(
     monkeypatch,
     data_config,
-    rollback_config,
+    framework_config,
     expected_rollback,
+    expected_capture_messages,
     expected_chat_template_kwargs,
 ):
     from omegaconf import OmegaConf
@@ -172,7 +181,7 @@ def test_build_gateway_manager_wires_gateway_config_defaults(
                     "custom": {
                         "agent_framework": {
                             "gateway_count": 2,
-                            **rollback_config,
+                            **framework_config,
                         }
                     },
                 },
@@ -189,6 +198,7 @@ def test_build_gateway_manager_wires_gateway_config_defaults(
     assert captured["gateway_actor_config"].response_length == 64
     assert captured["gateway_actor_config"].tool_parser_name == "hermes"
     assert captured["gateway_actor_config"].enable_last_assistant_rollback is expected_rollback
+    assert captured["gateway_actor_config"].capture_messages is expected_capture_messages
     assert isinstance(captured["gateway_actor_config"].apply_chat_template_kwargs, dict)
     assert captured["gateway_actor_config"].apply_chat_template_kwargs == expected_chat_template_kwargs
 
@@ -291,6 +301,7 @@ def _trajectory(
     reward_info: dict[str, object] | None = None,
     num_turns: int = 2,
     routed_experts: object | None = None,
+    messages: list[dict[str, object]] | None = None,
     extra_fields: dict[str, object] | None = None,
 ):
     prompt_ids = prompt_ids or [10, 11]
@@ -304,6 +315,7 @@ def _trajectory(
         reward_info=dict(reward_info or {}),
         reward_score=None,
         num_turns=num_turns,
+        messages=messages,
         routed_experts=routed_experts,
         multi_modal_data={"images": ["raw-image-should-not-be-written"]},
         extra_fields=dict(extra_fields or {}),
@@ -417,6 +429,65 @@ async def test_framework_and_runner_logs_share_one_session_directory(tmp_path, f
     else:
         assert not framework_log.exists()
         assert "session session-sample-0-rollout-0-" in task_log.read_text()
+
+
+@pytest.mark.asyncio
+async def test_trajectory_dump_includes_optional_messages_and_keeps_token_arrays_aligned(tmp_path):
+    framework = await _build_framework_with_agent_runners(
+        agent_runners={"runner": _inline_runner_config(_async_noop_runner)},
+        gateway_manager=_FakeGatewayManager({}),
+    )
+    messages = [
+        {"role": "user", "content": "run"},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_exact",
+                    "type": "function",
+                    "function": {"name": "search", "arguments": {"query": "weather"}},
+                }
+            ],
+        },
+    ]
+    trajectories = [
+        _trajectory(
+            prompt_ids=[1, 2, 3],
+            response_ids=[4, 5],
+            response_mask=[1, 0],
+            response_logprobs=[-0.1, 0.0],
+            messages=messages,
+        ),
+        _trajectory(prompt_ids=[6], response_ids=[7, 8, 9], response_mask=[1, 1, 1]),
+    ]
+
+    framework._dump_trajectories(tmp_path, "session-dump", trajectories)
+
+    metadata = json.loads((tmp_path / "trajectory.json").read_text())
+    assert metadata["session_id"] == "session-dump"
+    assert metadata["num_trajectories"] == 2
+    assert metadata["trajectories"][0]["messages"] == messages
+    assert "messages" not in metadata["trajectories"][1]
+    assert [(item["prompt_len"], item["response_len"]) for item in metadata["trajectories"]] == [(3, 2), (1, 3)]
+
+    with np.load(tmp_path / "trajectory.npz") as arrays:
+        assert set(arrays.files) == {
+            "traj0_prompt_ids",
+            "traj0_response_ids",
+            "traj0_response_mask",
+            "traj0_response_logprobs",
+            "traj1_prompt_ids",
+            "traj1_response_ids",
+            "traj1_response_mask",
+        }
+        assert arrays["traj0_prompt_ids"].tolist() == [1, 2, 3]
+        assert arrays["traj0_response_ids"].tolist() == [4, 5]
+        assert arrays["traj0_response_mask"].tolist() == [1, 0]
+        assert arrays["traj0_response_logprobs"].tolist() == pytest.approx([-0.1, 0.0])
+        assert arrays["traj1_prompt_ids"].tolist() == [6]
+        assert arrays["traj1_response_ids"].tolist() == [7, 8, 9]
+        assert arrays["traj1_response_mask"].tolist() == [1, 1, 1]
 
 
 @pytest.mark.asyncio

@@ -16,14 +16,17 @@ import os
 import shlex
 import time
 from pathlib import Path
+from typing import TYPE_CHECKING
 from urllib.parse import urlparse
 
 import httpx
 
 from examples.blackbox_recipes.claude_code.dataset import extract_image
 from examples.blackbox_recipes.claude_code.reward import build_reward_context, evaluate_in_env
-from uni_agent.gateway.session import SessionHandle
 from uni_agent.sandbox import Sandbox, SandboxConfig, build_sandbox
+
+if TYPE_CHECKING:
+    from uni_agent.gateway.session import SessionHandle
 
 logger = logging.getLogger(__name__)
 
@@ -165,10 +168,7 @@ def build_claude_command(
         "ANTHROPIC_DEFAULT_SONNET_MODEL": model,
         "ANTHROPIC_DEFAULT_OPUS_MODEL": model,
         "ANTHROPIC_SMALL_FAST_MODEL": model,
-        "CLAUDE_CODE_DISABLE_BACKGROUND_TASKS": "1",
         "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-        "CLAUDE_CODE_FORK_SUBAGENT": "0",
-        "CLAUDE_CODE_SUBAGENT_MODEL": model,
         "DISABLE_AUTOUPDATER": "1",
         "IS_SANDBOX": "1",
     }
@@ -196,10 +196,14 @@ def build_claude_command(
     ]
     if disable_slash_commands:
         argv.append("--disable-slash-commands")
+    disallowed_tools = ["AskUserQuestion"]
     if disable_web_tools:
-        argv.extend(["--disallowedTools", "Agent", "Task", "WebFetch", "WebSearch"])
+        disallowed_tools.extend(["WebFetch", "WebSearch"])
+    argv.extend(["--disallowedTools", *disallowed_tools])
     return (
-        "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy; "
+        "unset HTTP_PROXY HTTPS_PROXY http_proxy https_proxy NO_PROXY no_proxy "
+        "CLAUDE_CODE_FORK_SUBAGENT CLAUDE_CODE_DISABLE_BACKGROUND_TASKS "
+        "CLAUDE_CODE_SUBAGENT_MODEL CLAUDE_AGENT_SDK_DISABLE_BUILTIN_AGENTS; "
         "cd /testbed; "
         f"{env_prefix} " + shlex.join(argv)
     )

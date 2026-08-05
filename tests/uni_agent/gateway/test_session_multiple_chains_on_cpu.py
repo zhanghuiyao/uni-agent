@@ -43,6 +43,7 @@ def _session(
     processor=None,
     vision_info_extractor=None,
     tool_parser_name: str | None = None,
+    capture_messages: bool = False,
 ) -> GatewaySession:
     return GatewaySession(
         SessionHandle(session_id=session_id),
@@ -56,6 +57,7 @@ def _session(
         response_length=response_length,
         sampling_params=sampling_params,
         enable_last_assistant_rollback=enable_last_assistant_rollback,
+        capture_messages=capture_messages,
     )
 
 
@@ -89,6 +91,41 @@ async def _run(session: GatewaySession, backend: SequencedBackend, messages: lis
         allowed_sampling_keys=ALLOWED_SAMPLING_KEYS,
     )
     return await session.run_generation(request, backend)
+
+
+@pytest.mark.asyncio
+async def test_message_capture_is_disabled_by_default():
+    session = _session("capture-disabled")
+
+    await _run(session, SequencedBackend(["DONE"]), [{"role": "user", "content": "run"}])
+    [trajectory] = await session.finalize()
+
+    assert trajectory.messages is None
+
+
+@pytest.mark.asyncio
+async def test_multiple_chains_capture_independent_deep_copies():
+    shared_content = [{"type": "text", "text": "same prompt"}]
+    prompt = [{"role": "user", "content": shared_content}]
+    session = _session("capture-multiple-chains", capture_messages=True)
+    backend = SequencedBackend(["FIRST", "SECOND"])
+
+    await _run(session, backend, prompt)
+    await _run(session, backend, prompt)
+    active_chains = list(session.active_chains)
+    trajectories = await session.finalize()
+
+    assert len(trajectories) == 2
+    assert [trajectory.messages[-1]["content"] for trajectory in trajectories] == ["FIRST", "SECOND"]
+    assert all(
+        trajectory.messages is not chain.message_history
+        for trajectory, chain in zip(trajectories, active_chains, strict=True)
+    )
+
+    shared_content[0]["text"] = "mutated request"
+    assert all(trajectory.messages[0]["content"][0]["text"] == "same prompt" for trajectory in trajectories)
+    trajectories[0].messages[0]["content"][0]["text"] = "mutated capture"
+    assert trajectories[1].messages[0]["content"][0]["text"] == "same prompt"
 
 
 class _LogprobBackend:
@@ -873,6 +910,7 @@ async def test_multiple_chains_length_exhaustion_closes_selected_chain_and_order
         "length-close",
         prompt_length=max(_prompt_length(main_first), _prompt_length(subagent)),
         response_length=len("MAIN1") + 1,
+        capture_messages=True,
     )
     backend = SequencedBackend(["MAIN1", "SUB"])
     main_too_long = [
@@ -893,6 +931,9 @@ async def test_multiple_chains_length_exhaustion_closes_selected_chain_and_order
     assert _decode_response_ids(trajectories[0].response_ids) == "SUB"
     assert _decode_response_ids(trajectories[1].response_ids) == "MAIN1"
     assert trajectories[1].extra_fields["materialization_reason"] == "max_trajectory_length"
+    assert trajectories[0].messages == [*subagent, {"role": "assistant", "content": "SUB"}]
+    assert trajectories[1].messages == [*main_first, {"role": "assistant", "content": "MAIN1"}]
+    assert main_too_long[-1] not in trajectories[1].messages
 
 
 @pytest.mark.asyncio
@@ -1511,6 +1552,45 @@ async def test_multiple_chains_tool_call_echo_reuses_chain_despite_fresh_tool_re
     assert decoded.startswith(tool_call_text)
     assert decoded.endswith("FINAL")
     assert 0 in trajectories[0].response_mask
+
+
+@pytest.mark.asyncio
+async def test_message_capture_preserves_exact_tool_call_ids_and_is_deep_copied(monkeypatch):
+    import uni_agent.gateway.session.codec as codec_mod
+
+    monkeypatch.setattr(codec_mod, "_extract_tool_calls_with_sglang_or_vllm", _fake_tool_call_dispatch)
+    session = _session("capture-tool-call", tool_parser_name="hermes", capture_messages=True)
+    tools = [{"type": "function", "function": {"name": "search", "parameters": {"type": "object"}}}]
+    tool_call_text = '<tool_call>\n{"name": "search", "arguments": {"query": "weather"}}\n</tool_call>'
+    backend = SequencedBackend([tool_call_text, "FINAL"])
+
+    first = await _run(
+        session,
+        backend,
+        [{"role": "user", "content": "what is the weather?"}],
+        tools=tools,
+    )
+    tool_call_id = first.assistant_msg["tool_calls"][0]["id"]
+    await _run(
+        session,
+        backend,
+        [
+            {"role": "user", "content": "what is the weather?"},
+            {"role": "assistant", "content": None, "tool_calls": first.assistant_msg["tool_calls"]},
+            {"role": "tool", "tool_call_id": tool_call_id, "content": "sunny and warm"},
+        ],
+        tools=tools,
+    )
+    chain = session.active_chains[0]
+    [trajectory] = await session.finalize()
+
+    assert trajectory.messages == chain.message_history
+    assert trajectory.messages is not chain.message_history
+    assert trajectory.messages[1]["tool_calls"][0]["id"] == tool_call_id
+    assert trajectory.messages[2]["tool_call_id"] == tool_call_id
+
+    chain.message_history[1]["tool_calls"][0]["id"] = "mutated_after_materialization"
+    assert trajectory.messages[1]["tool_calls"][0]["id"] == tool_call_id
 
 
 @pytest.mark.asyncio

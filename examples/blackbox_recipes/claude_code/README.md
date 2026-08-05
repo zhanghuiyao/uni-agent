@@ -108,10 +108,79 @@ The training YAML keeps `claude_code` as the only runner:
 agent_runner_fqn: examples.blackbox_recipes.claude_code.claude_code_runner.claude_code_runner
 ```
 
-## 3. Configuration
+## 3. Standalone SWE-bench Inference
+
+`run_infer.sh` runs rollout and reward evaluation without starting the trainer.
+`MAX_SAMPLES=N` selects the first `N` Parquet rows in their original order;
+`MAX_SAMPLES=-1` selects all rows. Zero and values below `-1` are rejected
+before Ray or the model server is initialized.
+
+```bash
+OPENYUANRONG_SERVER_ADDRESS="<address>" \
+OPENYUANRONG_TOKEN="<token>" \
+MODEL_PATH=~/models/Qwen3.5-9B \
+DATA_PATH=~/data/swe_agent/swe_bench_verified.parquet \
+MAX_SAMPLES=10 \
+VLLM_LANGUAGE_MODEL_ONLY=1 \
+MAX_NUM_BATCHED_TOKENS=8192 \
+OUTPUT_DIR="$PWD/outputs/claude_code_infer/swebench-first-10" \
+bash examples/blackbox_recipes/claude_code/run_infer.sh
+```
+
+SWE-bench tasks are text-only, so the wrapper enables vLLM's language-model-only
+mode by default. This prevents multimodal modules and dummy image profiling from
+consuming GPU memory. Set `VLLM_LANGUAGE_MODEL_ONLY=0` only when running a dataset
+that contains multimodal inputs. `MAX_NUM_BATCHED_TOKENS` controls the engine's
+per-batch scheduling budget independently of the model context length.
+
+If `OUTPUT_DIR` is omitted, the wrapper creates a distinct timestamped run path
+under `outputs/claude_code_infer/`. Each completed session is persisted by the
+Framework as it finishes; the top-level `summary.json` is atomically published
+only after generation, reporting, and gateway shutdown complete.
+
+```text
+outputs/claude_code_infer/<run-id>/
+|-- summary.json
+|-- session-sample-0-rollout-0-<uuid>/
+|   |-- framework.log
+|   |-- task.log
+|   |-- trajectory.json
+|   `-- trajectory.npz
+`-- session-sample-1-rollout-0-<uuid>/
+    |-- framework.log
+    |-- task.log
+    |-- trajectory.json
+    `-- trajectory.npz
+```
+
+`trajectory.json` contains readable reward/length metadata and, by default,
+the exact normalized message history. `trajectory.npz` contains compressed
+token IDs, response masks, and log probabilities. If a run is interrupted,
+already completed session directories remain available even though the final
+`summary.json` is intentionally absent.
+
+Captured messages can contain SWE-bench prompts, repository code, tool inputs,
+and tool outputs. Treat the output directory as sensitive. To retain only the
+token trajectory and compact metadata, disable readable message capture:
+
+```bash
+SAVE_TRAJECTORY_MESSAGES=0 \
+MAX_SAMPLES=10 \
+bash examples/blackbox_recipes/claude_code/run_infer.sh
+```
+
+Claude Code's built-in subagent decision remains on its official defaults; the
+recipe does not require or force delegation.
+
+## 4. Configuration
 
 | Variable | Default | Description |
 |----------|---------|-------------|
+| `MAX_SAMPLES` | `-1` | Dataset prefix length; positive values run rows `[0, N)`, while `-1` runs all rows |
+| `OUTPUT_DIR` | timestamped path under `outputs/claude_code_infer/` | Per-run root for session artifacts and the completed `summary.json` |
+| `SAVE_TRAJECTORY_MESSAGES` | `1` | Include exact normalized messages in `trajectory.json`; set `0` for token-only capture |
+| `VLLM_LANGUAGE_MODEL_ONLY` | `1` | Disable vLLM multimodal inputs and modules for text-only SWE-bench; accepts `0` or `1` |
+| `MAX_NUM_BATCHED_TOKENS` | `8192` | Maximum tokens scheduled in one engine batch; must be a positive integer |
 | `AGENT_MAX_TURNS` | `100` | `claude --max-turns` (the agent's turn budget); read by the runner from the `AGENT_MAX_TURNS` env var |
 | `SWE_AGENT_EVAL_TIMEOUT` | `600` | Reward evaluation timeout (seconds) |
 | `SWE_AGENT_RUN_TIMEOUT` | `7200` | Max wall time for the claude process in the sandbox |

@@ -71,6 +71,35 @@ def test_gateway_actor_config_enables_last_assistant_rollback_by_default():
     assert GatewayActorConfig(tokenizer=FakeTokenizer()).enable_last_assistant_rollback is True
 
 
+@pytest.mark.parametrize("value", ["true", 1, None])
+def test_gateway_actor_config_rejects_non_bool_capture_messages(value):
+    from uni_agent.gateway.config import GatewayActorConfig
+
+    with pytest.raises(ValueError, match="capture_messages must be a bool"):
+        GatewayActorConfig(tokenizer=FakeTokenizer(), capture_messages=value)
+
+
+def test_gateway_actor_config_disables_message_capture_by_default():
+    from uni_agent.gateway.config import GatewayActorConfig
+
+    assert GatewayActorConfig(tokenizer=FakeTokenizer()).capture_messages is False
+
+
+@pytest.mark.asyncio
+async def test_gateway_actor_forwards_message_capture_to_session():
+    from uni_agent.gateway.config import GatewayActorConfig
+    from uni_agent.gateway.gateway import _GatewayActor
+
+    actor = _GatewayActor(
+        GatewayActorConfig(tokenizer=FakeTokenizer(), capture_messages=True),
+        SequencedBackend(["DONE"]),
+    )
+    actor._server_base_url = "http://test"
+    await actor.create_session("capture-enabled")
+
+    assert actor._sessions["capture-enabled"]._capture_messages is True
+
+
 @pytest.mark.asyncio
 async def test_gateway_actor_forwards_last_assistant_rollback_to_session():
     from uni_agent.gateway.config import GatewayActorConfig

@@ -794,7 +794,7 @@ class OpenAICompatibleAgentFramework(AgentFramework):
     def _trajectory_meta(self, traj: Trajectory) -> dict[str, object]:
         """Small, human-readable per-trajectory summary; the token arrays live in the npz."""
         extra = traj.extra_fields or {}
-        return {
+        meta: dict[str, object] = {
             "num_turns": traj.num_turns,
             "finished": traj.reward_info.get("finished"),
             "reward_score": traj.reward_score,
@@ -807,6 +807,9 @@ class OpenAICompatibleAgentFramework(AgentFramework):
             "has_routed_experts": traj.routed_experts is not None,
             "has_logprobs": traj.response_logprobs is not None,
         }
+        if traj.messages is not None:
+            meta["messages"] = traj.messages
+        return meta
 
     def _score_from_reward_info(
         self, session_trajectories: list[Trajectory]

@@ -62,6 +62,8 @@ class Trajectory:
         extra_fields: Gateway-owned extension fields, such as trajectory
             materialization metadata consumed by training adapters and the
             ``min_global_steps``/``max_global_steps`` weight-version span.
+        messages: Optional deep-copied normalized message history for offline
+            inspection. Generic gateway use leaves this unset by default.
     """
 
     prompt_ids: list[int]
@@ -74,3 +76,4 @@ class Trajectory:
     routed_experts: torch.Tensor | np.ndarray | None = None
     multi_modal_data: dict[str, Any] | None = None
     extra_fields: dict[str, Any] = field(default_factory=dict)
+    messages: list[dict[str, Any]] | None = None

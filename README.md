@@ -1,107 +1,98 @@
-<h1>Uni-Agent: Train Long-Horizon Agents at Scale</h1>
+# claude-code 轨迹分析
 
-<p>
-  <a href="https://uni-agent.readthedocs.io/en/latest/index.html"><img src="https://img.shields.io/badge/Documentation-6D28D9?style=flat-square" alt="Documentation"></a>
-  <a href="https://github.com/verl-project/uni-agent/stargazers"><img src="https://img.shields.io/github/stars/verl-project/uni-agent?style=flat-square&logo=github&label=Stars" alt="GitHub Stars"></a>
-  <a href="./LICENSE"><img src="https://img.shields.io/badge/License-Apache%202.0-2563EB?style=flat-square" alt="Apache 2.0 License"></a>
-</p>
+## TL;DR
 
-Uni-Agent is a framework for training long-horizon agents:
+结论：默认cc配置下会视情况拉起subagent，不过在当前最新代码下(7.31)不会导致链的快速异常分裂，基本上每个subagent只会分裂一条链。
 
-- Bring any existing agent harness into reinforcement learning.
-- Unify diverse agent tasks through one extensible interface.
-- Run agents concurrently at scale and collect traceable trajectories as training-ready data (SFT and RL).
+## 主要结果
 
-<p>
-  <img src="./assets/uni-agent.png" width="80%" alt="Uni-Agent architecture overview">
-</p>
+> 运行记录：155:/tmp/uni-agent-cc-subagent-exp1/outputs
 
-## Highlights ✨
+修改 uni-agent 中 subagent 相关配置为 cc 默认配置，在swe-bench verified选取前 50 个任务用默认的方式运行，50 个任务中有 3 个任务拉起了 subagent，共生成 66 条 chain:
 
-### Plug in any agent harness
+- 47 个任务：1 条链，无 subagent
+- 2  个任务（sample 22、44）：各 2 条链，分别拉起 1 个 subagent
+- 1  个任务（sample 42）：15 条链，拉起 14 个 subagent
 
-Connect harnesses such as Claude Code and Mini-SWE-Agent, or any harness that can point its OpenAI- or Anthropic-compatible model endpoint at the **Uni-Agent Gateway**: request string in, training tokens out.
+## 主要改动
 
-### Decouple agents, tasks, and infrastructure
+> 基于 7.31 main 分支代码 commit_id: b49d017c
 
-Build white-box agents from reusable `Agent`, `Tool`, `Task`, and `Sandbox` abstractions. Customize agent logic, tools, task environments, sandbox backends, and rewards independently while reusing the same evaluation and training runtime.
+- 在 `_CC_QUIET_ENV` 中删除 `CLAUDE_CODE_FORK_SUBAGENT`/`CLAUDE_CODE_DISABLE_BACKGROUND_TASKS`
+- 在 `disallowed_tools` 中删除 `Agent` / `Task`
+- 指定 `CLAUDE_CODE_SUBAGENT_MODEL` 为默认模型
 
-### Run thousands of sessions concurrently
+## 详细轨迹分析
 
-Run 1,000+ long-horizon, stateful sessions with distributed workers, pooled Gateway sessions, isolated sandboxes, and asynchronous scheduling. Every trajectory, log, and reward remains associated with the correct session for reliable evaluation, RL training, and data synthesis.
+| Sample | Instance | 链数 | Agentic turns（各链） | Subagent | Score |
+|---:|---|---:|---|---:|---:|
+| 0 | astropy__astropy-12907 | 1 | 28 | 否 | 1 |
+| 1 | astropy__astropy-13033 | 1 | 51 | 否 | 0 |
+| 2 | astropy__astropy-13236 | 1 | 29 | 否 | 0 |
+| 3 | astropy__astropy-13398 | 1 | 100 | 否 | 0 |
+| 4 | astropy__astropy-13453 | 1 | 100 | 否 | 0 |
+| 5 | astropy__astropy-13579 | 1 | 56 | 否 | 0 |
+| 6 | astropy__astropy-13977 | 1 | 44 | 否 | 0 |
+| 7 | astropy__astropy-14096 | 1 | 100 | 否 | 0 |
+| 8 | astropy__astropy-14182 | 1 | 38 | 否 | 0 |
+| 9 | astropy__astropy-14309 | 1 | 25 | 否 | 1 |
+| 10 | astropy__astropy-14365 | 1 | 20 | 否 | 0 |
+| 11 | astropy__astropy-14369 | 1 | 63 | 否 | 0 |
+| 12 | astropy__astropy-14508 | 1 | 46 | 否 | 0 |
+| 13 | astropy__astropy-14539 | 1 | 84 | 否 | 0 |
+| 14 | astropy__astropy-14598 | 1 | 100 | 否 | 0 |
+| 15 | astropy__astropy-14995 | 1 | 22 | 否 | 0 |
+| 16 | astropy__astropy-7166 | 1 | 8 | 否 | 0 |
+| 17 | astropy__astropy-7336 | 1 | 22 | 否 | 0 |
+| 18 | astropy__astropy-7606 | 1 | 6 | 否 | 0 |
+| 19 | astropy__astropy-7671 | 1 | 11 | 否 | 0 |
+| 20 | astropy__astropy-8707 | 1 | 63 | 否 | 0 |
+| 21 | astropy__astropy-8872 | 1 | 31 | 否 | 0 |
+| 22 | django__django-10097 | **2** | **3 / 100** | **是，1 个** | 0 |
+| 23 | django__django-10554 | 1 | 100 | 否 | 0 |
+| 24 | django__django-10880 | 1 | 87 | 否 | 0 |
+| 25 | django__django-10914 | 1 | 46 | 否 | 0 |
+| 26 | django__django-10973 | 1 | 100 | 否 | 0 |
+| 27 | django__django-10999 | 1 | 7 | 否 | 0 |
+| 28 | django__django-11066 | 1 | 65 | 否 | 1 |
+| 29 | django__django-11087 | 1 | 100 | 否 | 0 |
+| 30 | django__django-11095 | 1 | 66 | 否 | 0 |
+| 31 | django__django-11099 | 1 | 25 | 否 | 0 |
+| 32 | django__django-11119 | 1 | 17 | 否 | 0 |
+| 33 | django__django-11133 | 1 | 30 | 否 | 0 |
+| 34 | django__django-11138 | 1 | 100 | 否 | 0 |
+| 35 | django__django-11141 | 1 | 90 | 否 | 0 |
+| 36 | django__django-11149 | 1 | 100 | 否 | 0 |
+| 37 | django__django-11163 | 1 | 100 | 否 | 0 |
+| 38 | django__django-11179 | 1 | 36 | 否 | 0 |
+| 39 | django__django-11206 | 1 | 78 | 否 | 0 |
+| 40 | django__django-11211 | 1 | 100 | 否 | 0 |
+| 41 | django__django-11239 | 1 | 43 | 否 | 0 |
+| 42 | django__django-11265 | **15** | **6 / 5 / 26 / 11 / 14 / 12 / 4 / 11 / 11 / 13 / 73 / 32 / 5 / 13 / 54** | **是，14 个** | 0 |
+| 43 | django__django-11276 | 1 | 46 | 否 | 1 |
+| 44 | django__django-11292 | **2** | **13 / 69** | **是，1 个** | 0 |
+| 45 | django__django-11299 | 1 | 100 | 否 | 0 |
+| 46 | django__django-11333 | 1 | 92 | 否 | 0 |
+| 47 | django__django-11400 | 1 | 77 | 否 | 0 |
+| 48 | django__django-11433 | 1 | 68 | 否 | 0 |
+| 49 | django__django-11451 | 1 | 54 | 否 | 0 |
 
-### Reproducible training, verifiable results
+- 多链任务：
+  - sample 22：1 条 100-turn 主链 + 1 条 3-turn subagent 链；总计 103 generations。
+  - sample 42：1 条 54-turn 主链  + 14 条 subagent 链；总计 290 generations。
+  - sample 44：1 条 69-turn 主链  + 1 条 13-turn subagent 链；总计 82 generations。
 
-We publish runnable [recipes](./examples/) with complete configurations, benchmark settings, result tables, and learning curves. Each recipe provides a tested starting point and makes reported improvements easier to reproduce and verify.
+- 分析：
+  - Qwen3.5-9 在 Claude-Code 下的 agent orchestration 能力不足，导致 sample 42 拉起 14 个 subagents。
 
-## Quickstart 🚀
+- subagent 判定有四重证据互相对应：
+  - 主链存在明确的 Agent tool call；
+  - 调用包含 subagent_type、description 和 prompt；
+  - 有实际 Agent 返回结果；
+  - 同时生成一条带 file-search-specialist system prompt 的独立 trajectory。
 
-Follow the end-to-end path:
+## 运行命令
 
-1. [Install Uni-Agent](https://uni-agent.readthedocs.io/en/latest/quickstart/installation.html)
-2. [Launch a sandbox and run code](https://uni-agent.readthedocs.io/en/latest/quickstart/launch-sandbox.html)
-3. [Run agent inference](https://uni-agent.readthedocs.io/en/latest/quickstart/agent-inference.html)
-4. [Train an agent with RL](https://uni-agent.readthedocs.io/en/latest/quickstart/rl-training.html)
-
-## Results 📊
-
-### Parallel Inference & Verification
-
-We compare Uni-Agent with existing agent systems on parallel inference and verification workloads.
-
-
-| Model            | Benchmark          | OpenHands | Uni-Agent | Setting |
-| ---------------- | ------------------ |:---------:|:---------:| ------- |
-| Qwen3-Coder-30B  | SWE-Bench Verified | -         | **49.2**  | Avg@4, 100 turns, 128K |
-| Qwen3-Coder-480B | SWE-Bench Verified | 62.4      | **64.2**  | Avg@4, 500 turns, 256K |
-| Qwen3-Coder-Next | SWE-Bench Verified | 66.6      | **67.6**  | Avg@4, 300 turns, 128K |
-| Qwen3.5-35B-A3B  | SWE-Bench Verified | 62.0      | **68.4**  | Avg@1, 200 turns, 128K |
-| Qwen3.6-35B-A3B  | Terminal-Bench v2  | -         | **42.5**  | Avg@1, 200K |
-
-Detailed settings and additional reference results are available in [Inference and Verification](https://uni-agent.readthedocs.io/en/latest/benchmark/inference.html).
-
-### Agent Reinforcement Learning
-
-Uni-Agent supports agent RL training with the same interaction stack used at inference time. We provide fully async training recipes across multiple tasks, models and datasets, with GRPO/GSPO-style objectives and partial rollout support.
-Example scripts are available in [examples/quickstart/training](examples/quickstart/training).
-
-
-| Model                        | Dataset      | Method | Setting | Base | RL |
-| ---------------------------- | ------------ | ------ | ------- |:----:|:--:|
-| Qwen3-30B-A3B-Instruct       | R2E-Gym      | GSPO   | Fully Async, 100 turns, 128K | 22.2 | **36.8** |
-| Qwen3-Coder-30B-A3B-Instruct | R2E-Gym      | GSPO   | Fully Async, 100 turns, 128K | 46.2 | **52.0** |
-| Qwen3.5-9B                   | SWE-reBench  | GRPO   | Fully Async, 100 turns, 128K | 53.8 | **59.2** |
-
-Training dynamics, asynchronous rollout performance, and reproducibility details are available in [RL Training](https://uni-agent.readthedocs.io/en/latest/benchmark/rl-training.html).
-
-
-
-## Roadmap 🗺️
-
-See the [Uni-Agent 26Q3 Roadmap](https://github.com/verl-project/uni-agent/issues/79) for current priorities and planned work.
-
-## Acknowledgement 🙏
-
-Uni-Agent's large-scale parallel interaction and verification rely on remote sandbox backends. We gratefully acknowledge:
-
-- **[veFaaS](https://www.volcengine.com/product/vefaas)**: Volcengine Function-as-a-Service, used as a serverless backend for elastically launching agent sandboxes at scale.
-- **[Modal](https://modal.com)**: serverless cloud compute used to spin up isolated, reproducible sandbox environments for agent execution and evaluation.
-
-## Citation 📚
-
-If you find the project helpful, please cite:
-
+```bash
+nohup env CUDA_VISIBLE_DEVICES=2,3,4,5 N_GPUS_PER_NODE=4 TP=2 ROLLOUT_GPU_MEM_UTIL=0.85 MAX_SAMPLES=50 MAX_CONCURRENT_SESSIONS=2 VLLM_LANGUAGE_MODEL_ONLY=1 MAX_NUM_BATCHED_TOKENS=8192 SAVE_TRAJECTORY_MESSAGES=1 bash examples/blackbox_recipes/claude_code/run_infer.sh > log_qwen35_9b.subagent.50.txt 2>&1 < /dev/null &
 ```
-@misc{uniagent_github,
-  author       = {Yuyang Ding and Bo Wen and Xubo Cao and Zhiqiang Zhai and Guangming Sheng and Xibin Wu and Juntao Li and Min Zhang and Uni-Agent Contributors},
-  title        = {Uni-Agent: Build, Run, and Train Agents at Scale},
-  year         = {2026},
-  howpublished = {\url{https://github.com/verl-project/uni-agent}},
-  note         = {GitHub repository. Supervisor: Xibin Wu and Juntao Li},
-  urldate      = {2026-03-27}
-}
-```
-
-## Contributing 🤝
-
-Community contributions are welcome. See [CONTRIBUTING.md](./CONTRIBUTING.md) for guidelines on how to get started.
